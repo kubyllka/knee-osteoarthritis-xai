@@ -1,4 +1,5 @@
 from io import BytesIO
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -15,6 +16,7 @@ from app.evaluation import (
     interpret_stability,
 )
 from app.inference import ONNXKneeOsteoarthritisClassifier
+from app.research.results import ResearchResultsValidationError, load_research_results, validate_research_results
 from app.xai import generate_xai_visualization, load_xai_model_by_name
 
 
@@ -33,6 +35,7 @@ DISCLAIMER = (
 
 XAI_METHODS = ["Grad-CAM", "Grad-CAM++", "Eigen-CAM", "Integrated Gradients", "SmoothGrad"]
 DEFAULT_XAI_METHODS = ["Grad-CAM", "Grad-CAM++", "Eigen-CAM"]
+RESEARCH_RESULTS_DIR = Path("results/research")
 
 
 @st.cache_resource
@@ -91,6 +94,111 @@ def show_prediction(prediction: dict) -> None:
         }
     )
     st.bar_chart(chart_data, x="Grade", y="Probability", height=280)
+
+
+def all_option(values) -> list[str]:
+    return ["All"] + sorted(str(value) for value in values if pd.notna(value))
+
+
+def show_research_mode() -> None:
+    st.header("Research Mode")
+    st.caption(
+        "Explore precomputed XAI evaluation results. This mode does not run models or metrics."
+    )
+
+    available_files = sorted(RESEARCH_RESULTS_DIR.glob("*.csv"))
+    source_options = [f"Repository file: {path.name}" for path in available_files]
+    source_options.append("Upload CSV for this session")
+    selected_source = st.selectbox("Research results source", source_options)
+
+    try:
+        if selected_source == "Upload CSV for this session":
+            uploaded_file = st.file_uploader("Upload a research-results CSV", type=["csv"])
+            if uploaded_file is None:
+                st.info("Choose a CSV file or select a repository file above.")
+                return
+            results = validate_research_results(pd.read_csv(uploaded_file))
+            st.caption(f"Loaded uploaded file: {uploaded_file.name}")
+        else:
+            selected_path = available_files[source_options.index(selected_source)]
+            results = load_research_results(selected_path)
+            st.caption(f"Loaded: {selected_path}")
+            if selected_path.name.startswith("demo_"):
+                st.warning("Demo data only: these values are synthetic and must not be used in research conclusions.")
+    except (OSError, pd.errors.ParserError, ResearchResultsValidationError) as exc:
+        st.error(f"Could not load research results: {exc}")
+        return
+
+    filters = st.columns(4)
+    selected_model = filters[0].selectbox("Model", all_option(results["model_name"].unique()))
+    selected_method = filters[1].selectbox("XAI method", all_option(results["xai_method"].unique()))
+    selected_metric = filters[2].selectbox("Metric", all_option(results["metric_name"].unique()))
+    correctness = filters[3].selectbox("Prediction correctness", ["All", "Correct", "Incorrect"])
+    selected_grades = st.multiselect(
+        "True KL grades",
+        options=[0, 1, 2, 3, 4],
+        default=[0, 1, 2, 3, 4],
+    )
+
+    filtered = results[results["true_kl"].isin(selected_grades)].copy()
+    if selected_model != "All":
+        filtered = filtered[filtered["model_name"] == selected_model]
+    if selected_method != "All":
+        filtered = filtered[filtered["xai_method"] == selected_method]
+    if selected_metric != "All":
+        filtered = filtered[filtered["metric_name"] == selected_metric]
+    if correctness == "Correct":
+        filtered = filtered[filtered["is_correct"]]
+    elif correctness == "Incorrect":
+        filtered = filtered[~filtered["is_correct"]]
+
+    if filtered.empty:
+        st.warning("No rows match the selected filters.")
+        return
+
+    summary = (
+        filtered.groupby("true_kl", as_index=False)
+        .agg(
+            Samples=("sample_id", "nunique"),
+            Mean=("metric_value", "mean"),
+            Median=("metric_value", "median"),
+            Standard_deviation=("metric_value", "std"),
+        )
+        .rename(columns={"true_kl": "True KL grade"})
+    )
+
+    st.subheader("Metric summary by KL grade")
+    st.dataframe(
+        summary.style.format({"Mean": "{:.4f}", "Median": "{:.4f}", "Standard_deviation": "{:.4f}"}),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.bar_chart(summary, x="True KL grade", y="Mean", height=300)
+
+    st.subheader("Metric-value distribution")
+    st.scatter_chart(
+        filtered,
+        x="true_kl",
+        y="metric_value",
+        color="xai_method",
+        height=320,
+    )
+
+    correctness_summary = (
+        filtered.groupby("is_correct", as_index=False)
+        .agg(Samples=("sample_id", "nunique"), Mean=("metric_value", "mean"), Median=("metric_value", "median"))
+        .replace({"is_correct": {True: "Correct", False: "Incorrect"}})
+        .rename(columns={"is_correct": "Prediction"})
+    )
+    st.subheader("Correct vs incorrect predictions")
+    st.dataframe(
+        correctness_summary.style.format({"Mean": "{:.4f}", "Median": "{:.4f}"}),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    with st.expander("Filtered research rows"):
+        st.dataframe(filtered, use_container_width=True, hide_index=True)
 
 
 def show_xai(
@@ -206,6 +314,11 @@ def main() -> None:
 
     st.title("KneeXAI: Explainable AI System for Osteoarthritis Severity Classification")
     st.warning(DISCLAIMER)
+
+    mode = st.radio("Application mode", ["Prediction", "Research"], horizontal=True)
+    if mode == "Research":
+        show_research_mode()
+        return
 
     with st.sidebar:
         model_options = {config["display_name"]: name for name, config in MODEL_CONFIGS.items()}
