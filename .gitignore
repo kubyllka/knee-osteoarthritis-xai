@@ -203,6 +203,10 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Trained model artifacts (kept locally; use Git LFS if they need to be versioned)
+models/*.onnx
+models/*.pth
+
 # Ruff stuff:
 .ruff_cache/
 
