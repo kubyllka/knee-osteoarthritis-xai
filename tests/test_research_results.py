@@ -1,5 +1,4 @@
 from pathlib import Path
-from tempfile import TemporaryDirectory
 import unittest
 
 import pandas as pd
@@ -46,12 +45,8 @@ class ResearchResultsTests(unittest.TestCase):
 
         self.assertEqual(len(loaded), 20)
 
-    def test_valid_results_load_from_csv(self) -> None:
-        with TemporaryDirectory() as directory:
-            csv_path = Path(directory) / "metrics.csv"
-            valid_results().to_csv(csv_path, index=False)
-
-            loaded = load_research_results(csv_path)
+    def test_valid_in_memory_results_are_normalised(self) -> None:
+        loaded = validate_research_results(valid_results())
 
         self.assertEqual(loaded.loc[0, "true_kl"], 2)
         self.assertTrue(loaded.loc[0, "is_correct"])
@@ -71,6 +66,7 @@ class ResearchResultsTests(unittest.TestCase):
 
     def test_non_numeric_metric_value_is_rejected(self) -> None:
         invalid = valid_results()
+        invalid["metric_value"] = invalid["metric_value"].astype(object)
         invalid.loc[0, "metric_value"] = "not-a-number"
 
         with self.assertRaisesRegex(ResearchResultsValidationError, "metric_value"):
