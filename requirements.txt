@@ -12,3 +12,4 @@ torchvision==0.20.1
 requests==2.32.3
 streamlit==1.41.1
 pandas==2.2.3
+quantus==0.6.0

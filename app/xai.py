@@ -283,3 +283,35 @@ def generate_xai_visualization(
         method=method,
         class_idx=explained_class,
     )
+
+
+def generate_xai_attributions(
+    model: torch.nn.Module,
+    inputs: np.ndarray,
+    targets: np.ndarray,
+    method: str,
+    model_name: str,
+) -> np.ndarray:
+    """Generate raw attribution maps for a NumPy batch, as required by evaluation libraries."""
+    if inputs.ndim != 4:
+        raise ValueError("inputs must have shape (batch, channels, height, width)")
+    if len(inputs) != len(targets):
+        raise ValueError("inputs and targets must have the same batch size")
+
+    device = next(model.parameters()).device
+    target_layer, reshape_transform = get_target_layer_and_transform(model, model_name)
+    explainer = ActivationXAI(model, target_layer, reshape_transform)
+    cams = []
+    try:
+        for input_array, target in zip(inputs, targets):
+            input_tensor = torch.from_numpy(input_array).unsqueeze(0).to(device=device, dtype=torch.float32)
+            cam, _ = explainer.generate(
+                input_tensor,
+                method=method,
+                class_idx=int(target),
+            )
+            cams.append(cam)
+    finally:
+        explainer.remove_hooks()
+
+    return np.asarray(cams, dtype=np.float32)[:, np.newaxis, :, :]

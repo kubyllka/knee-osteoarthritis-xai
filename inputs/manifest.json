@@ -1,0 +1,41 @@
+{
+  "description": "Demo knee X-ray samples included with the project. Paths are relative to the project root.",
+  "samples": [
+    {
+      "sample_id": "kl-0-1",
+      "image_path": "inputs/kl-0-1.png",
+      "true_kl": 0,
+      "split": "demo"
+    },
+    {
+      "sample_id": "kl-1-1",
+      "image_path": "inputs/kl-1-1.png",
+      "true_kl": 1,
+      "split": "demo"
+    },
+    {
+      "sample_id": "kl-1-2",
+      "image_path": "inputs/kl-1-2.png",
+      "true_kl": 1,
+      "split": "demo"
+    },
+    {
+      "sample_id": "kl-2",
+      "image_path": "inputs/kl-2.png",
+      "true_kl": 2,
+      "split": "demo"
+    },
+    {
+      "sample_id": "kl-3",
+      "image_path": "inputs/kl-3.png",
+      "true_kl": 3,
+      "split": "demo"
+    },
+    {
+      "sample_id": "kl-4",
+      "image_path": "inputs/kl-4.png",
+      "true_kl": 4,
+      "split": "demo"
+    }
+  ]
+}
