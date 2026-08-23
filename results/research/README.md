@@ -24,3 +24,13 @@ metric_name, metric_category, metric_value
 Research comparisons by disease severity use `true_kl`. Comparisons of correct and incorrect predictions use `is_correct`.
 
 `demo_xai_metrics.csv` is synthetic data included only to demonstrate the Research Mode interface. It is not an experiment result and must not be used in analysis or reported conclusions.
+
+## Creating real results
+
+Run the offline pipeline from the project root. It reads `inputs/manifest.json` by default and writes a valid Research Mode CSV.
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_research.py --model resnet50 --methods "Grad-CAM" SmoothGrad
+```
+
+For a quick smoke run on one sample, use `--limit 1 --infidelity-samples 1 --max-sensitivity-samples 1`. Use GPU-enabled Kaggle or another CUDA runtime for larger research runs.
