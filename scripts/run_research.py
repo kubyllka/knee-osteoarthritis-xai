@@ -14,22 +14,51 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import MODEL_CONFIGS
 from app.evaluation import build_deletion_metrics, build_stability_metrics
-from app.metric_registry import metric_definition, serialise_parameters
+from app.metric_registry import metric_definition, parse_parameters, serialise_parameters
 from app.inference import ONNXKneeOsteoarthritisClassifier
 from app.quantus_metrics import QuantusScore, evaluate_quantus_metrics
 from app.research.manifest import DatasetSample, load_dataset_manifest
-from app.research.results import validate_research_results
+from app.research.results import load_research_results, validate_research_results
 from app.xai import generate_xai_visualization, load_xai_model_by_name, preprocess_pil_for_torch
 
 
 DEFAULT_METHODS = ["Grad-CAM", "SmoothGrad"]
+RUNNER_METRICS = frozenset(
+    {
+        "FaithfulnessCorrelation",
+        "MaxSensitivity",
+        "Sparseness",
+        "Deletion confidence drop",
+        "Stability score",
+    }
+)
+
+
+def resolve_device(requested_device: str) -> torch.device:
+    """Resolve the requested XAI device without silently falling back from CUDA."""
+    if requested_device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if requested_device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA was requested, but this PyTorch installation cannot access a CUDA GPU. "
+                "Install a CUDA-compatible PyTorch build or use --device cpu."
+            )
+        return torch.device("cuda")
+    if requested_device == "cpu":
+        return torch.device("cpu")
+    raise ValueError("device must be one of: auto, cuda, cpu")
 
 
 def set_research_seed(seed: int) -> None:
-    """Seed every random generator used by the current CPU research pipeline."""
+    """Seed Python, NumPy and PyTorch generators used by a research run."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 def prediction_to_dict(prediction) -> dict:
@@ -99,6 +128,7 @@ def custom_metric_rows(
     run_id: str,
     seed: int,
     checkpoint_version: str,
+    device_name: str,
 ) -> list[dict]:
     def predict_fn(image_bytes: bytes, _: str) -> dict:
         return prediction_to_dict(classifier.predict(image_bytes))
@@ -126,14 +156,14 @@ def custom_metric_rows(
             model_name,
             xai_result.method,
             "Deletion confidence drop",
-            "custom",
+            deletion_definition.category,
             float(deletion_table.iloc[0]["Confidence drop"]),
             run_id,
             seed,
             checkpoint_version,
             deletion_definition.source,
             deletion_definition.score_direction,
-            {"masking": "top_20_percent", "replacement": "image_mean"},
+            {"masking": "top_20_percent", "replacement": "image_mean", "device": device_name},
         ),
         metric_row(
             sample,
@@ -141,14 +171,14 @@ def custom_metric_rows(
             model_name,
             xai_result.method,
             "Stability score",
-            "custom",
+            stability_definition.category,
             float(stability_table.iloc[0]["Stability score"]),
             run_id,
             seed,
             checkpoint_version,
             stability_definition.source,
             stability_definition.score_direction,
-            {"brightness_multiplier": 1.05, "contrast_multiplier": 1.05},
+            {"brightness_multiplier": 1.05, "contrast_multiplier": 1.05, "device": device_name},
         ),
     ]
 
@@ -162,6 +192,7 @@ def quantus_metric_rows(
     run_id: str,
     seed: int,
     checkpoint_version: str,
+    device_name: str,
 ) -> list[dict]:
     return [
         metric_row(
@@ -177,10 +208,79 @@ def quantus_metric_rows(
             checkpoint_version,
             "quantus",
             score.score_direction,
-            score.parameters,
+            {**score.parameters, "device": device_name},
         )
         for score in scores
     ]
+
+
+def _validate_resume_configuration(
+    existing: pd.DataFrame,
+    *,
+    model_name: str,
+    run_id: str,
+    seed: int,
+    checkpoint_version: str,
+    faithfulness_runs: int,
+    max_sensitivity_samples: int,
+    device_name: str,
+) -> None:
+    """Reject a resume attempt that would mix incompatible experimental settings."""
+    expected = {
+        "model_name": model_name,
+        "run_id": run_id,
+        "seed": seed,
+        "checkpoint_version": checkpoint_version,
+    }
+    for column, value in expected.items():
+        if column not in existing.columns or set(existing[column].dropna().astype(str)) != {str(value)}:
+            raise ValueError(f"Cannot resume: existing output has a different {column}.")
+
+    expected_parameters = {
+        "FaithfulnessCorrelation": {"nr_runs": faithfulness_runs},
+        "MaxSensitivity": {"nr_samples": max_sensitivity_samples},
+    }
+    for metric_name, expected_values in expected_parameters.items():
+        metric_rows = existing[existing["metric_name"] == metric_name]
+        if metric_rows.empty:
+            continue
+        for value in metric_rows.get("metric_parameters", pd.Series(dtype="object")).dropna():
+            parameters = parse_parameters(value)
+            if parameters is None:
+                raise ValueError("Cannot resume: existing output has no readable metric configuration.")
+            if parameters.get("device") != device_name:
+                raise ValueError("Cannot resume: existing output was created on a different device.")
+            for key, expected_value in expected_values.items():
+                if parameters.get(key) != expected_value:
+                    raise ValueError(f"Cannot resume: existing {metric_name} uses a different {key}.")
+
+    # All other fields are fixed by this pipeline version. Multiple parameter
+    # objects for a metric would mean an interrupted file mixed experiments.
+    for metric_name, metric_rows in existing.groupby("metric_name"):
+        parameter_texts = set(metric_rows.get("metric_parameters", pd.Series(dtype="object")).dropna().astype(str))
+        if not parameter_texts:
+            raise ValueError(f"Cannot resume: {metric_name} has no stored metric configuration.")
+        if len(parameter_texts) != 1:
+            raise ValueError(f"Cannot resume: {metric_name} contains mixed metric configurations.")
+        parameters = parse_parameters(next(iter(parameter_texts)))
+        if parameters is None or parameters.get("device") != device_name:
+            raise ValueError(f"Cannot resume: {metric_name} was created with a different or unreadable device configuration.")
+
+
+def completed_combinations(rows: pd.DataFrame) -> set[tuple[str, str]]:
+    """Return sample/method pairs which already contain every runner metric."""
+    completed = set()
+    for (sample_id, method), group in rows.groupby(["sample_id", "xai_method"]):
+        if RUNNER_METRICS.issubset(set(group["metric_name"])):
+            completed.add((str(sample_id), str(method)))
+    return completed
+
+
+def _write_validated_rows(rows: list[dict], output_path: Path) -> pd.DataFrame:
+    results = validate_research_results(pd.DataFrame(rows))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    results.to_csv(output_path, index=False)
+    return results
 
 
 def run_research(
@@ -191,10 +291,14 @@ def run_research(
     run_id: str,
     seed: int,
     limit: int | None,
-    infidelity_samples: int,
+    faithfulness_runs: int,
     max_sensitivity_samples: int,
+    device: str = "auto",
+    resume: bool = False,
 ) -> pd.DataFrame:
     set_research_seed(seed)
+    selected_device = resolve_device(device)
+    device_name = str(selected_device)
     samples = load_dataset_manifest(manifest_path)
     if limit is not None:
         samples = samples[:limit]
@@ -203,15 +307,35 @@ def run_research(
 
     model_config = MODEL_CONFIGS[model_name]
     classifier = ONNXKneeOsteoarthritisClassifier(model_config["onnx_path"])
-    xai_model = load_xai_model_by_name(model_name)
+    xai_model = load_xai_model_by_name(model_name, device=selected_device)
     checkpoint_version = model_config["checkpoint_path"].name
-    rows = []
+    rows: list[dict] = []
+    if output_path.exists():
+        if not resume:
+            raise FileExistsError(
+                f"Output already exists: {output_path}. Use --resume to continue this run or choose a new --output path."
+            )
+        existing = load_research_results(output_path)
+        _validate_resume_configuration(
+            existing,
+            model_name=model_name,
+            run_id=run_id,
+            seed=seed,
+            checkpoint_version=checkpoint_version,
+            faithfulness_runs=faithfulness_runs,
+            max_sensitivity_samples=max_sensitivity_samples,
+            device_name=device_name,
+        )
+        rows = existing.to_dict("records")
+    complete_pairs = completed_combinations(pd.DataFrame(rows)) if rows else set()
+    print(f"XAI device: {device_name}")
 
     for sample_index, sample in enumerate(samples, start=1):
         image_bytes = sample.image_path.read_bytes()
         prediction = prediction_to_dict(classifier.predict(image_bytes))
         image = Image.open(sample.image_path).convert("RGB")
         _, input_tensor = preprocess_pil_for_torch(image)
+        input_tensor = input_tensor.to(selected_device)
         with torch.no_grad():
             xai_prediction = int(xai_model(input_tensor).argmax(dim=1).item())
         if xai_prediction != int(prediction["grade"]):
@@ -225,6 +349,16 @@ def run_research(
         )
 
         for method in methods:
+            pair = (sample.sample_id, method)
+            if pair in complete_pairs:
+                print(f"  {method}: already complete, skipped")
+                continue
+            # An interrupted write may contain only some of a pair's metrics.
+            # Replace that incomplete set rather than introducing duplicates.
+            rows = [
+                row for row in rows
+                if not (str(row["sample_id"]) == sample.sample_id and str(row["xai_method"]) == method)
+            ]
             xai_result = generate_xai_visualization(
                 model=xai_model,
                 image=image,
@@ -239,7 +373,7 @@ def run_research(
                 target_class=xai_result.class_idx,
                 xai_method=method,
                 model_name=model_name,
-                infidelity_samples=infidelity_samples,
+                faithfulness_runs=faithfulness_runs,
                 max_sensitivity_samples=max_sensitivity_samples,
             )
             rows.extend(
@@ -252,6 +386,7 @@ def run_research(
                     run_id,
                     seed,
                     checkpoint_version,
+                    device_name,
                 )
             )
             rows.extend(
@@ -265,13 +400,13 @@ def run_research(
                     run_id,
                     seed,
                     checkpoint_version,
+                    device_name,
                 )
             )
+            _write_validated_rows(rows, output_path)
+            complete_pairs.add(pair)
 
-    results = validate_research_results(pd.DataFrame(rows))
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    results.to_csv(output_path, index=False)
-    return results
+    return _write_validated_rows(rows, output_path)
 
 
 def parse_args():
@@ -283,13 +418,15 @@ def parse_args():
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--infidelity-samples", type=int, default=8)
+    parser.add_argument("--faithfulness-runs", type=int, default=50)
     parser.add_argument("--max-sensitivity-samples", type=int, default=8)
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    parser.add_argument("--resume", action="store_true", help="Continue a matching partially completed output CSV.")
     args = parser.parse_args()
 
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
-    if args.infidelity_samples <= 0 or args.max_sensitivity_samples <= 0:
+    if args.faithfulness_runs <= 0 or args.max_sensitivity_samples <= 0:
         parser.error("Quantus sample counts must be positive")
 
     if args.run_id is None:
@@ -309,7 +446,9 @@ if __name__ == "__main__":
         run_id=arguments.run_id,
         seed=arguments.seed,
         limit=arguments.limit,
-        infidelity_samples=arguments.infidelity_samples,
+        faithfulness_runs=arguments.faithfulness_runs,
         max_sensitivity_samples=arguments.max_sensitivity_samples,
+        device=arguments.device,
+        resume=arguments.resume,
     )
     print(f"Saved {len(dataframe)} metric rows to: {arguments.output}")

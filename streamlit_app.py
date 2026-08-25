@@ -20,7 +20,7 @@ from app.evaluation import (
     interpret_stability,
 )
 from app.inference import ONNXKneeOsteoarthritisClassifier
-from app.metric_registry import format_metric_value, metric_definition, parse_parameters
+from app.metric_registry import is_legacy_metric, metric_definition, parse_parameters
 from app.quantus_metrics import evaluate_quantus_metrics
 from app.research.results import ResearchResultsValidationError, load_research_results, validate_research_results
 from app.xai import generate_xai_visualization, load_xai_model_by_name, preprocess_pil_for_torch
@@ -42,6 +42,8 @@ DISCLAIMER = (
 XAI_METHODS = ["Grad-CAM", "Grad-CAM++", "Eigen-CAM", "Integrated Gradients", "SmoothGrad"]
 DEFAULT_XAI_METHODS = ["Grad-CAM", "Grad-CAM++", "Eigen-CAM"]
 RESEARCH_RESULTS_DIR = Path("results/research")
+QUICK_FAITHFULNESS_RUNS = 8
+QUICK_MAX_SENSITIVITY_SAMPLES = 2
 
 
 @st.cache_resource
@@ -106,6 +108,174 @@ def all_option(values) -> list[str]:
     return ["All"] + sorted(str(value) for value in values if pd.notna(value))
 
 
+def _metric_tooltip_format(display_format: str) -> str:
+    return ".3f" if display_format == "{:.3f}" else ".4f"
+
+
+def _metric_scale(metric_name: str):
+    return alt.Scale(domain=[-1, 1]) if metric_name == "FaithfulnessCorrelation" else None
+
+
+def _summary_by(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    return (
+        frame.groupby(columns, as_index=False)
+        .agg(
+            Samples=("sample_id", "nunique"),
+            Median=("metric_value", "median"),
+            Mean=("metric_value", "mean"),
+            Q1=("metric_value", lambda values: values.quantile(0.25)),
+            Q3=("metric_value", lambda values: values.quantile(0.75)),
+        )
+        .assign(IQR=lambda table: table["Q3"] - table["Q1"])
+    )
+
+
+def _format_summary(summary: pd.DataFrame, display_format: str):
+    return summary.style.format(
+        {
+            "Median": display_format,
+            "Mean": display_format,
+            "Q1": display_format,
+            "Q3": display_format,
+            "IQR": display_format,
+        }
+    )
+
+
+DIMENSIONS = (
+    ("Faithfulness", "faithfulness"),
+    ("Robustness", "robustness"),
+    ("Complexity", "complexity"),
+    ("Custom checks", "custom"),
+)
+
+
+def _metric_category(metric_name: str, csv_category: str) -> str:
+    """Use current definitions for known metrics, including older CSVs."""
+    definition = metric_definition(metric_name)
+    return definition.category if definition else csv_category
+
+
+def _selected_metric_rows(frame: pd.DataFrame, metric_name: str) -> pd.DataFrame:
+    """Keep every visual summary strictly within one metric scale."""
+    selected = frame[frame["metric_name"] == metric_name].copy()
+    if selected["metric_name"].nunique() != 1:
+        raise ValueError("Dashboard summaries must contain exactly one metric.")
+    return selected
+
+
+def _metric_chart(frame: pd.DataFrame, x_field: str, x_title: str, definition, display_format: str):
+    metric_name = frame["metric_name"].iloc[0]
+    y = alt.Y("metric_value:Q", title=metric_name, scale=_metric_scale(metric_name))
+    tooltip = [
+        "sample_id:N", "xai_method:N", "true_kl:O", "predicted_kl:O",
+        alt.Tooltip("metric_value:Q", title="Value", format=_metric_tooltip_format(display_format)),
+    ]
+    boxplot = alt.Chart(frame).mark_boxplot(size=28, opacity=0.45).encode(
+        x=alt.X(f"{x_field}:N", title=x_title, sort=["0", "1", "2", "3", "4"] if x_field == "true_kl" else None),
+        xOffset=alt.XOffset("xai_method:N"),
+        y=y,
+        color=alt.Color("xai_method:N", title="XAI method"),
+    )
+    points = alt.Chart(frame).mark_circle(size=58, opacity=0.78).encode(
+        x=alt.X(f"{x_field}:N", title=x_title, sort=["0", "1", "2", "3", "4"] if x_field == "true_kl" else None),
+        xOffset=alt.XOffset("xai_method:N"),
+        y=y,
+        color=alt.Color("xai_method:N", title="XAI method"),
+        tooltip=tooltip,
+    )
+    chart = boxplot + points
+    if metric_name == "FaithfulnessCorrelation":
+        zero = alt.Chart(pd.DataFrame({"zero": [0]})).mark_rule(color="#777", strokeDash=[5, 4]).encode(y="zero:Q")
+        chart = zero + chart
+    return chart.properties(height=350)
+
+
+def _summary_card_values(filtered: pd.DataFrame, definition) -> dict[str, object]:
+    samples = filtered["sample_id"].nunique()
+    sample_rows = filtered.drop_duplicates("sample_id")
+    correct_rate = sample_rows["is_correct"].mean()
+    by_method = _summary_by(filtered, ["xai_method"])
+    by_grade = _summary_by(filtered, ["true_kl"])
+    ascending = definition.score_direction == "lower"
+    method = by_method.sort_values("Median", ascending=ascending).iloc[0]
+    best_grade = by_grade.sort_values("Median", ascending=ascending).iloc[0]
+    worst_grade = by_grade.sort_values("Median", ascending=not ascending).iloc[0]
+    concentration = definition.category == "complexity"
+
+    return {
+        "samples": samples,
+        "correct_rate": correct_rate,
+        "method_label": "Most concentrated method" if concentration else "Best method by median",
+        "method": str(method["xai_method"]),
+        "best_grade_label": "Most concentrated KL grade" if concentration else "Best KL grade",
+        "best_grade": int(best_grade["true_kl"]),
+        "worst_grade_label": "Least concentrated KL grade" if concentration else "Worst KL grade",
+        "worst_grade": int(worst_grade["true_kl"]),
+    }
+
+
+def _summary_cards(filtered: pd.DataFrame, definition) -> None:
+    values = _summary_card_values(filtered, definition)
+    cards = st.columns(5)
+    cards[0].metric("Unique images", str(values["samples"]))
+    cards[1].metric("Correct predictions", f"{values['correct_rate']:.0%}")
+    cards[2].metric(values["method_label"], values["method"])
+    cards[3].metric(values["best_grade_label"], f"KL{values['best_grade']}")
+    cards[4].metric(values["worst_grade_label"], f"KL{values['worst_grade']}")
+
+
+def _show_metric_dashboard(filtered: pd.DataFrame, selected_metric: str) -> None:
+    definition = metric_definition(selected_metric)
+    if definition is None:
+        st.warning("This legacy metric has no registered display metadata. Its raw rows are shown below.")
+        with st.expander("Filtered research rows"):
+            st.dataframe(filtered, use_container_width=True, hide_index=True)
+        return
+
+    display_format = definition.display_format
+    st.subheader(selected_metric)
+    st.caption(f"**{definition.score_direction.title()} is better.** {definition.description} {definition.interpretation}")
+    _summary_cards(filtered, definition)
+    if definition.category == "complexity":
+        st.info("Sparseness is descriptive: 'most concentrated' does not mean clinically best explanation.")
+    if is_legacy_metric(selected_metric):
+        st.warning("Legacy metric: Infidelity is retained only for historical CSV inspection and is excluded from new runs.")
+
+    parameter_values = []
+    if "metric_parameters" in filtered.columns:
+        parameter_values = [parse_parameters(value) for value in filtered["metric_parameters"].dropna().unique()]
+        parameter_values = [value for value in parameter_values if value is not None]
+    if not parameter_values:
+        st.warning("Legacy result file: exact metric configuration was not stored with these rows.")
+    else:
+        with st.expander("Metric configuration"):
+            st.json(parameter_values[0] if len(parameter_values) == 1 else parameter_values)
+        if selected_metric == "FaithfulnessCorrelation" and min(item.get("nr_runs", 0) for item in parameter_values) < 8:
+            st.warning("This FaithfulnessCorrelation run uses fewer than 8 perturbation runs; it is a technical preview, not thesis evidence.")
+
+    group_summary = _summary_by(filtered, ["true_kl", "xai_method"])
+    if group_summary["Samples"].min() < 10:
+        st.warning("Small-sample comparison: at least one KL × method group has fewer than 10 images. Inspect patterns, but do not draw statistical conclusions.")
+
+    st.subheader("XAI quality by true KL grade")
+    st.caption("Each point is one image. Boxes summarise the distribution for each KL grade and XAI method.")
+    st.altair_chart(_metric_chart(filtered, "true_kl", "True KL grade", definition, display_format), use_container_width=True)
+
+    st.subheader("Correct vs incorrect predictions")
+    correctness_frame = filtered.assign(prediction_group=np.where(filtered["is_correct"], "Correct", "Incorrect"))
+    if correctness_frame["prediction_group"].nunique() < 2:
+        st.info("No correct-vs-incorrect comparison is available under the active filters because all selected images have the same prediction outcome.")
+    else:
+        st.altair_chart(_metric_chart(correctness_frame, "prediction_group", "Prediction outcome", definition, display_format), use_container_width=True)
+
+    st.subheader("KL grade × XAI method summary")
+    summary = group_summary.rename(columns={"true_kl": "True KL grade"})
+    st.dataframe(_format_summary(summary, display_format), use_container_width=True, hide_index=True)
+    with st.expander("Filtered research rows"):
+        st.dataframe(filtered, use_container_width=True, hide_index=True)
+
+
 def show_research_mode() -> None:
     st.header("Research Mode")
     st.caption(
@@ -135,30 +305,26 @@ def show_research_mode() -> None:
         st.error(f"Could not load research results: {exc}")
         return
 
-    visible_metrics = sorted(
-        metric for metric in results["metric_name"].unique() if metric != "Focus area ratio"
-    )
-    if not visible_metrics:
+    results = results[results["metric_name"] != "Focus area ratio"].copy()
+    if results.empty:
         st.warning("This file contains no supported, non-legacy metrics.")
         return
 
     filters = st.columns(4)
     selected_model = filters[0].selectbox("Model", all_option(results["model_name"].unique()))
     selected_method = filters[1].selectbox("XAI method", all_option(results["xai_method"].unique()))
-    selected_metric = filters[2].selectbox("Metric", visible_metrics)
-    correctness = filters[3].selectbox("Prediction correctness", ["All", "Correct", "Incorrect"])
-    selected_grades = st.multiselect(
-        "True KL grades",
+    selected_grades = filters[2].multiselect(
+        "True KL grade",
         options=[0, 1, 2, 3, 4],
         default=[0, 1, 2, 3, 4],
     )
+    correctness = filters[3].selectbox("Prediction correctness", ["All", "Correct", "Incorrect"])
 
     filtered = results[results["true_kl"].isin(selected_grades)].copy()
     if selected_model != "All":
         filtered = filtered[filtered["model_name"] == selected_model]
     if selected_method != "All":
         filtered = filtered[filtered["xai_method"] == selected_method]
-    filtered = filtered[filtered["metric_name"] == selected_metric]
     if correctness == "Correct":
         filtered = filtered[filtered["is_correct"]]
     elif correctness == "Incorrect":
@@ -168,90 +334,23 @@ def show_research_mode() -> None:
         st.warning("No rows match the selected filters.")
         return
 
-    definition = metric_definition(selected_metric)
-    if definition is None:
-        st.warning("Legacy metric: no registered description or display rule is available.")
-        display_format = "{:.4f}"
-        direction = filtered.get("score_direction", pd.Series(["unknown"])).iloc[0]
-    else:
-        display_format = definition.display_format
-        direction = definition.score_direction
-
-    st.subheader(selected_metric)
-    if definition is not None:
-        info = st.columns(3)
-        info[0].metric("Category", definition.category.title())
-        info[1].metric("Score direction", f"{definition.score_direction.title()} is better")
-        info[2].metric("Metric rows", str(len(filtered)))
-        st.caption(f"{definition.description} {definition.interpretation}")
-    else:
-        st.caption(f"Score direction: {direction}. Interpret this legacy metric only with its original experiment documentation.")
-
-    if "metric_parameters" not in filtered.columns or filtered["metric_parameters"].isna().all():
-        st.info("Legacy result file: metric configuration was not saved with these rows.")
-    else:
-        parameter_values = [parse_parameters(value) for value in filtered["metric_parameters"].dropna().unique()]
-        with st.expander("Metric configuration"):
-            st.json(parameter_values[0] if len(parameter_values) == 1 else parameter_values)
-
-    summary = (
-        filtered.groupby(["true_kl", "xai_method"], as_index=False)
-        .agg(
-            Samples=("sample_id", "nunique"),
-            Mean=("metric_value", "mean"),
-            Median=("metric_value", "median"),
-            Standard_deviation=("metric_value", "std"),
-        )
-        .rename(columns={"true_kl": "True KL grade"})
-    )
-
-    if summary["Samples"].min() < 10:
-        st.warning("Small-sample view: fewer than 10 images are available in at least one group. Use this for inspection, not statistical conclusions.")
-
-    st.subheader("Summary by true KL grade and XAI method")
-    st.dataframe(
-        summary.style.format({"Mean": display_format, "Median": display_format, "Standard_deviation": display_format}),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.altair_chart(
-        alt.Chart(summary).mark_bar().encode(
-            x=alt.X("True KL grade:O", title="True KL grade"),
-            y=alt.Y("Mean:Q", title=f"Mean {selected_metric}"),
-            color=alt.Color("xai_method:N", title="XAI method"),
-            xOffset="xai_method:N",
-            tooltip=["True KL grade:O", "xai_method:N", "Samples:Q", alt.Tooltip("Mean:Q", format=".3e" if display_format == "{:.3e}" else ".4f"), alt.Tooltip("Median:Q", format=".3e" if display_format == "{:.3e}" else ".4f")],
-        ),
-        use_container_width=True,
-    )
-
-    st.subheader("Individual metric values by true KL grade")
-    st.altair_chart(
-        alt.Chart(filtered).mark_circle(size=75, opacity=0.75).encode(
-            x=alt.X("true_kl:O", title="True KL grade"),
-            y=alt.Y("metric_value:Q", title=selected_metric),
-            color=alt.Color("xai_method:N", title="XAI method"),
-            tooltip=["sample_id:N", "xai_method:N", "true_kl:O", "predicted_kl:O", alt.Tooltip("metric_value:Q", format=".3e" if display_format == "{:.3e}" else ".4f")],
-        ),
-        use_container_width=True,
-    )
-
-    correctness_summary = (
-        filtered.groupby(["is_correct", "xai_method"], as_index=False)
-        .agg(Samples=("sample_id", "nunique"), Mean=("metric_value", "mean"), Median=("metric_value", "median"))
-        .replace({"is_correct": {True: "Correct", False: "Incorrect"}})
-        .rename(columns={"is_correct": "Prediction"})
-    )
-    st.subheader("Correct vs incorrect predictions")
-    st.dataframe(
-        correctness_summary.style.format({"Mean": display_format, "Median": display_format}),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    with st.expander("Filtered research rows"):
-        st.dataframe(filtered, use_container_width=True, hide_index=True)
+    filtered["dashboard_category"] = [
+        _metric_category(metric, category)
+        for metric, category in zip(filtered["metric_name"], filtered["metric_category"])
+    ]
+    tabs = st.tabs([label for label, _ in DIMENSIONS])
+    for tab, (label, category) in zip(tabs, DIMENSIONS):
+        with tab:
+            category_rows = filtered[filtered["dashboard_category"] == category]
+            if category_rows.empty:
+                if category == "custom":
+                    st.info("No dataset-wide custom agreement metrics are available yet. This tab is reserved for future agreement checks.")
+                else:
+                    st.info(f"No {label.lower()} metrics match the active filters.")
+                continue
+            metrics = sorted(category_rows["metric_name"].unique())
+            selected_metric = metrics[0] if len(metrics) == 1 else st.selectbox("Metric", metrics, key=f"research-metric-{category}")
+            _show_metric_dashboard(_selected_metric_rows(category_rows, selected_metric), selected_metric)
 
 
 def show_xai(
@@ -362,7 +461,7 @@ def show_xai(
     st.write(interpret_stability(average_stability))
 
     st.subheader("Quantus evaluation (exploratory)")
-    st.caption("Runs only when requested. This quick profile uses 2 perturbation samples and is not a dataset-level research result.")
+    st.caption("Runs only when requested. This quick profile uses 8 faithfulness runs and 2 sensitivity samples; it is not a dataset-level research result.")
     if st.button("Evaluate selected XAI methods", key=f"quantus-{model_name}-{','.join(methods)}"):
         random.seed(42)
         np.random.seed(42)
@@ -379,8 +478,8 @@ def show_xai(
                         target_class=result.class_idx,
                         xai_method=result.method,
                         model_name=model_name,
-                        infidelity_samples=2,
-                        max_sensitivity_samples=2,
+                        faithfulness_runs=QUICK_FAITHFULNESS_RUNS,
+                        max_sensitivity_samples=QUICK_MAX_SENSITIVITY_SAMPLES,
                     ):
                         score_rows.append({
                             "XAI method": result.method,

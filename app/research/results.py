@@ -112,6 +112,12 @@ def validate_research_results(results: pd.DataFrame) -> pd.DataFrame:
     cleaned["confidence"] = _finite_float_column(cleaned, "confidence", 0.0, 1.0)
     cleaned["metric_value"] = _finite_float_column(cleaned, "metric_value")
 
+    correlation_rows = cleaned["metric_name"].eq("FaithfulnessCorrelation")
+    if not cleaned.loc[correlation_rows, "metric_value"].between(-1.0, 1.0).all():
+        raise ResearchResultsValidationError(
+            "FaithfulnessCorrelation metric_value must be between -1 and 1."
+        )
+
     _require_non_empty_text(cleaned, "metric_category")
     cleaned["metric_category"] = cleaned["metric_category"].str.lower()
     unknown_categories = sorted(set(cleaned["metric_category"]) - VALID_METRIC_CATEGORIES)

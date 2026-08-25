@@ -16,6 +16,14 @@ class MetricDefinition:
 
 
 METRIC_REGISTRY: dict[str, MetricDefinition] = {
+    "FaithfulnessCorrelation": MetricDefinition(
+        category="faithfulness",
+        score_direction="higher",
+        description="Correlation between attribution importance and model-output changes after feature perturbations.",
+        interpretation="Higher values indicate better relative faithfulness. Scores range from -1 to 1.",
+        display_format="{:.3f}",
+        source="quantus",
+    ),
     "Infidelity": MetricDefinition(
         category="faithfulness",
         score_direction="lower",
@@ -41,7 +49,7 @@ METRIC_REGISTRY: dict[str, MetricDefinition] = {
         source="quantus",
     ),
     "Deletion confidence drop": MetricDefinition(
-        category="custom",
+        category="faithfulness",
         score_direction="higher",
         description="Decrease in predicted-class confidence after masking the top 20% XAI region.",
         interpretation="Higher values suggest that the selected region was influential for this prediction.",
@@ -49,7 +57,7 @@ METRIC_REGISTRY: dict[str, MetricDefinition] = {
         source="custom",
     ),
     "Stability score": MetricDefinition(
-        category="custom",
+        category="robustness",
         score_direction="higher",
         description="Agreement of an explanation before and after +5% brightness and +5% contrast perturbation.",
         interpretation="Higher values indicate more stable spatial explanations under this specific perturbation.",
@@ -59,8 +67,15 @@ METRIC_REGISTRY: dict[str, MetricDefinition] = {
 }
 
 
+LEGACY_METRICS = frozenset({"Infidelity"})
+
+
 def metric_definition(metric_name: str) -> MetricDefinition | None:
     return METRIC_REGISTRY.get(metric_name)
+
+
+def is_legacy_metric(metric_name: str) -> bool:
+    return metric_name in LEGACY_METRICS
 
 
 def format_metric_value(metric_name: str, value: float) -> str:

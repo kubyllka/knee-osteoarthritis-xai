@@ -13,14 +13,14 @@ Research Mode reads precomputed experiment CSV files and presents one XAI metric
 - KL grade prediction with probability distribution and confidence;
 - interactive XAI heatmaps and overlays for five explanation methods;
 - deletion and stability checks for a single prediction;
-- optional Quantus metrics: Infidelity, MaxSensitivity, and Sparseness;
+- optional Quantus metrics: FaithfulnessCorrelation, MaxSensitivity, and Sparseness;
 - Research Mode for filtering and comparing precomputed experiment results by model, XAI method, true KL grade, and prediction correctness.
 
 ## Application modes
 
 **Prediction Mode** is intended for analysing one uploaded X-ray. It generates a model prediction and selected XAI maps. Quantus evaluation is optional and uses a small exploratory profile so it does not run automatically on every upload.
 
-**Research Mode** is intended for already computed results. Select one metric at a time to view its definition, direction of interpretation, configuration, distribution by true KL grade, and comparison between XAI methods. A CSV row represents one `sample x XAI method x metric` value; details of the results format are in [`results/research/README.md`](results/research/README.md).
+**Research Mode** is intended for already computed results. It is organised by evaluation dimension: Faithfulness, Robustness, Complexity, and future Custom checks. Within a dimension, select one metric to view its definition, configuration, XAI quality by true KL grade, and correct-versus-incorrect prediction comparison. A CSV row represents one `sample x XAI method x metric` value; details of the results format are in [`results/research/README.md`](results/research/README.md).
 
 ## Project structure
 
@@ -57,7 +57,7 @@ Place images listed in `inputs/manifest.json` locally, ensure the corresponding 
 .\.venv\Scripts\python.exe scripts\run_research.py --model resnet50 --methods "Grad-CAM" SmoothGrad
 ```
 
-The runner writes a validated CSV to `results/research/`. Use a GPU-enabled environment for larger experiments. The small one-image / one-perturbation command is a pipeline check only; it is not sufficient for scientific conclusions.
+The runner writes a validated partial CSV to `results/research/` after each completed image/method pair. Use `--device auto` to select CUDA when available, or `--device cuda` to require it; continue a matching interrupted run with `--resume`. CUDA setup is documented separately in [`requirements-gpu.md`](requirements-gpu.md). The small one-image / one-perturbation command is a pipeline check only; it is not sufficient for scientific conclusions.
 
 To add DenseNet-121, place its checkpoint at `models/densenet121_finetune_block3_4_best.pth` and export the matching ONNX file:
 
@@ -70,6 +70,6 @@ Only export checkpoints you trust: older PyTorch checkpoints can contain trainin
 
 ## Notes on XAI evaluation
 
-Metric values should be compared only within the same model, dataset split, XAI configuration, and Quantus configuration. In particular, Infidelity is an MSE-based lower-is-better metric and can have values much larger than 1. No individual metric alone establishes explanation quality.
+Metric values should be compared only within the same model, dataset split, XAI configuration, and Quantus configuration. New runs use the bounded, higher-is-better `FaithfulnessCorrelation` metric for faithfulness; old Infidelity rows are legacy data and are not comparable to new runs. No individual metric alone establishes explanation quality.
 
 > This project is intended for educational and research purposes only. It is not a clinical diagnostic tool.

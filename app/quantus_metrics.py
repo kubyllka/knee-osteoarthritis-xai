@@ -61,7 +61,7 @@ def evaluate_quantus_metrics(
     target_class: int,
     xai_method: str,
     model_name: str,
-    infidelity_samples: int = 8,
+    faithfulness_runs: int = 50,
     max_sensitivity_samples: int = 8,
 ) -> list[QuantusScore]:
     """Evaluate one XAI map with the initial Quantus metric set."""
@@ -75,7 +75,8 @@ def evaluate_quantus_metrics(
     x_batch = input_tensor.detach().cpu().numpy().astype(np.float32)
     y_batch = np.asarray([target_class], dtype=np.int64)
     a_batch = attribution[np.newaxis, np.newaxis, :, :].astype(np.float32)
-    patch_size = max(1, min(16, attribution.shape[0], attribution.shape[1]))
+    feature_count = int(attribution.shape[0] * attribution.shape[1])
+    subset_size = max(1, min(224, feature_count - 1))
     device = str(_model_device(model))
 
     def explain_func(model, inputs, targets, **_):
@@ -88,11 +89,11 @@ def evaluate_quantus_metrics(
         )
 
     metric_scores = {
-        "Infidelity": quantus.Infidelity(
-            perturb_patch_sizes=[patch_size],
-            n_perturb_samples=infidelity_samples,
-            # The input is ImageNet-normalised, so an explicit mean baseline is
-            # clearer and more reproducible than calling normalised zero "black".
+        "FaithfulnessCorrelation": quantus.FaithfulnessCorrelation(
+            nr_runs=faithfulness_runs,
+            subset_size=subset_size,
+            abs=False,
+            normalise=True,
             perturb_baseline="mean",
             disable_warnings=True,
         )(
@@ -127,11 +128,11 @@ def evaluate_quantus_metrics(
     }
 
     parameters = {
-        "Infidelity": {
-            "attribution": "raw_scale_preserving",
-            "loss": "mse",
-            "n_perturb_samples": infidelity_samples,
-            "patch_size": patch_size,
+        "FaithfulnessCorrelation": {
+            "attribution": "normalise_by_max",
+            "abs": False,
+            "nr_runs": faithfulness_runs,
+            "subset_size": subset_size,
             "perturb_baseline": "mean",
             "model_output": "logit",
         },

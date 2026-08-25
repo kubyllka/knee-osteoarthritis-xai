@@ -29,7 +29,7 @@ class QuantusMetricsTests(unittest.TestCase):
                 target_class=0,
                 xai_method="Grad-CAM",
                 model_name="resnet50",
-                infidelity_samples=2,
+                faithfulness_runs=2,
                 max_sensitivity_samples=2,
             )
         except RuntimeError as exc:
@@ -37,10 +37,12 @@ class QuantusMetricsTests(unittest.TestCase):
                 self.skipTest(str(exc))
             raise
 
-        self.assertEqual([score.metric_name for score in scores], ["Infidelity", "MaxSensitivity", "Sparseness"])
+        self.assertEqual([score.metric_name for score in scores], ["FaithfulnessCorrelation", "MaxSensitivity", "Sparseness"])
         self.assertTrue(all(np.isfinite(score.value) for score in scores))
-        self.assertEqual(scores[0].score_direction, "lower")
-        self.assertEqual(scores[0].parameters["attribution"], "raw_scale_preserving")
+        self.assertGreaterEqual(scores[0].value, -1.0)
+        self.assertLessEqual(scores[0].value, 1.0)
+        self.assertEqual(scores[0].score_direction, "higher")
+        self.assertEqual(scores[0].parameters["attribution"], "normalise_by_max")
         self.assertEqual(mock_attributions.call_count, 2)
 
 

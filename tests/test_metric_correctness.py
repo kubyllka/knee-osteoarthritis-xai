@@ -47,9 +47,17 @@ class MetricCorrectnessTests(unittest.TestCase):
         with self.assertRaisesRegex(ResearchResultsValidationError, "metric_parameters"):
             validate_research_results(invalid)
 
-    def test_infidelity_has_scientific_display_rule(self) -> None:
-        self.assertEqual(metric_definition("Infidelity").score_direction, "lower")
-        self.assertEqual(format_metric_value("Infidelity", 750866100.0), "7.509e+08")
+    def test_faithfulness_correlation_is_bounded_and_higher_is_better(self) -> None:
+        definition = metric_definition("FaithfulnessCorrelation")
+        self.assertEqual(definition.score_direction, "higher")
+        self.assertEqual(format_metric_value("FaithfulnessCorrelation", 0.1256), "0.126")
+
+    def test_out_of_range_faithfulness_correlation_is_rejected(self) -> None:
+        invalid = valid_results()
+        invalid["metric_name"] = "FaithfulnessCorrelation"
+        invalid["metric_value"] = 1.1
+        with self.assertRaisesRegex(ResearchResultsValidationError, "between -1 and 1"):
+            validate_research_results(invalid)
 
 
 if __name__ == "__main__":

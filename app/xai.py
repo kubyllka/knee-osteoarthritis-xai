@@ -88,21 +88,24 @@ def get_target_layer_and_transform(model: torch.nn.Module, model_name: str):
 def load_xai_model(
     checkpoint_path: Path = PYTORCH_CHECKPOINT_PATH,
     model_name: str = "vit",
+    device: torch.device | str = "cpu",
 ) -> torch.nn.Module:
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"PyTorch checkpoint not found: {checkpoint_path}")
 
     model = create_xai_model(model_name)
     model = load_checkpoint(model, checkpoint_path)
-    model.eval()
-    return model
+    return model.to(device).eval()
 
 
-def load_xai_model_by_name(model_name: str) -> torch.nn.Module:
+def load_xai_model_by_name(
+    model_name: str,
+    device: torch.device | str = "cpu",
+) -> torch.nn.Module:
     if model_name not in MODEL_CONFIGS:
         raise ValueError(f"Unsupported model name: {model_name}")
     checkpoint_path = MODEL_CONFIGS[model_name]["checkpoint_path"]
-    return load_xai_model(checkpoint_path=checkpoint_path, model_name=model_name)
+    return load_xai_model(checkpoint_path=checkpoint_path, model_name=model_name, device=device)
 
 
 def preprocess_pil_for_torch(image: Image.Image) -> tuple[Image.Image, torch.Tensor]:
@@ -295,6 +298,7 @@ def generate_xai_visualization(
     model_name: str = "vit",
 ) -> XAIResult:
     original, input_tensor = preprocess_pil_for_torch(image)
+    input_tensor = input_tensor.to(next(model.parameters()).device)
     target_layer, reshape_transform = get_target_layer_and_transform(model, model_name)
     explainer = ActivationXAI(model, target_layer, reshape_transform)
     try:
