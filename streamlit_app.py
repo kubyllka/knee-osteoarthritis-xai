@@ -1,9 +1,13 @@
 from io import BytesIO
 from pathlib import Path
+import random
 
+import altair as alt
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import torch
 from PIL import Image
 
 from app.config import KL_LABELS, MODEL_CONFIGS
@@ -16,8 +20,10 @@ from app.evaluation import (
     interpret_stability,
 )
 from app.inference import ONNXKneeOsteoarthritisClassifier
+from app.metric_registry import format_metric_value, metric_definition, parse_parameters
+from app.quantus_metrics import evaluate_quantus_metrics
 from app.research.results import ResearchResultsValidationError, load_research_results, validate_research_results
-from app.xai import generate_xai_visualization, load_xai_model_by_name
+from app.xai import generate_xai_visualization, load_xai_model_by_name, preprocess_pil_for_torch
 
 
 GRADE_MEANINGS = {
@@ -129,10 +135,17 @@ def show_research_mode() -> None:
         st.error(f"Could not load research results: {exc}")
         return
 
+    visible_metrics = sorted(
+        metric for metric in results["metric_name"].unique() if metric != "Focus area ratio"
+    )
+    if not visible_metrics:
+        st.warning("This file contains no supported, non-legacy metrics.")
+        return
+
     filters = st.columns(4)
     selected_model = filters[0].selectbox("Model", all_option(results["model_name"].unique()))
     selected_method = filters[1].selectbox("XAI method", all_option(results["xai_method"].unique()))
-    selected_metric = filters[2].selectbox("Metric", all_option(results["metric_name"].unique()))
+    selected_metric = filters[2].selectbox("Metric", visible_metrics)
     correctness = filters[3].selectbox("Prediction correctness", ["All", "Correct", "Incorrect"])
     selected_grades = st.multiselect(
         "True KL grades",
@@ -145,8 +158,7 @@ def show_research_mode() -> None:
         filtered = filtered[filtered["model_name"] == selected_model]
     if selected_method != "All":
         filtered = filtered[filtered["xai_method"] == selected_method]
-    if selected_metric != "All":
-        filtered = filtered[filtered["metric_name"] == selected_metric]
+    filtered = filtered[filtered["metric_name"] == selected_metric]
     if correctness == "Correct":
         filtered = filtered[filtered["is_correct"]]
     elif correctness == "Incorrect":
@@ -156,8 +168,34 @@ def show_research_mode() -> None:
         st.warning("No rows match the selected filters.")
         return
 
+    definition = metric_definition(selected_metric)
+    if definition is None:
+        st.warning("Legacy metric: no registered description or display rule is available.")
+        display_format = "{:.4f}"
+        direction = filtered.get("score_direction", pd.Series(["unknown"])).iloc[0]
+    else:
+        display_format = definition.display_format
+        direction = definition.score_direction
+
+    st.subheader(selected_metric)
+    if definition is not None:
+        info = st.columns(3)
+        info[0].metric("Category", definition.category.title())
+        info[1].metric("Score direction", f"{definition.score_direction.title()} is better")
+        info[2].metric("Metric rows", str(len(filtered)))
+        st.caption(f"{definition.description} {definition.interpretation}")
+    else:
+        st.caption(f"Score direction: {direction}. Interpret this legacy metric only with its original experiment documentation.")
+
+    if "metric_parameters" not in filtered.columns or filtered["metric_parameters"].isna().all():
+        st.info("Legacy result file: metric configuration was not saved with these rows.")
+    else:
+        parameter_values = [parse_parameters(value) for value in filtered["metric_parameters"].dropna().unique()]
+        with st.expander("Metric configuration"):
+            st.json(parameter_values[0] if len(parameter_values) == 1 else parameter_values)
+
     summary = (
-        filtered.groupby("true_kl", as_index=False)
+        filtered.groupby(["true_kl", "xai_method"], as_index=False)
         .agg(
             Samples=("sample_id", "nunique"),
             Mean=("metric_value", "mean"),
@@ -167,32 +205,47 @@ def show_research_mode() -> None:
         .rename(columns={"true_kl": "True KL grade"})
     )
 
-    st.subheader("Metric summary by KL grade")
+    if summary["Samples"].min() < 10:
+        st.warning("Small-sample view: fewer than 10 images are available in at least one group. Use this for inspection, not statistical conclusions.")
+
+    st.subheader("Summary by true KL grade and XAI method")
     st.dataframe(
-        summary.style.format({"Mean": "{:.4f}", "Median": "{:.4f}", "Standard_deviation": "{:.4f}"}),
+        summary.style.format({"Mean": display_format, "Median": display_format, "Standard_deviation": display_format}),
         use_container_width=True,
         hide_index=True,
     )
-    st.bar_chart(summary, x="True KL grade", y="Mean", height=300)
 
-    st.subheader("Metric-value distribution")
-    st.scatter_chart(
-        filtered,
-        x="true_kl",
-        y="metric_value",
-        color="xai_method",
-        height=320,
+    st.altair_chart(
+        alt.Chart(summary).mark_bar().encode(
+            x=alt.X("True KL grade:O", title="True KL grade"),
+            y=alt.Y("Mean:Q", title=f"Mean {selected_metric}"),
+            color=alt.Color("xai_method:N", title="XAI method"),
+            xOffset="xai_method:N",
+            tooltip=["True KL grade:O", "xai_method:N", "Samples:Q", alt.Tooltip("Mean:Q", format=".3e" if display_format == "{:.3e}" else ".4f"), alt.Tooltip("Median:Q", format=".3e" if display_format == "{:.3e}" else ".4f")],
+        ),
+        use_container_width=True,
+    )
+
+    st.subheader("Individual metric values by true KL grade")
+    st.altair_chart(
+        alt.Chart(filtered).mark_circle(size=75, opacity=0.75).encode(
+            x=alt.X("true_kl:O", title="True KL grade"),
+            y=alt.Y("metric_value:Q", title=selected_metric),
+            color=alt.Color("xai_method:N", title="XAI method"),
+            tooltip=["sample_id:N", "xai_method:N", "true_kl:O", "predicted_kl:O", alt.Tooltip("metric_value:Q", format=".3e" if display_format == "{:.3e}" else ".4f")],
+        ),
+        use_container_width=True,
     )
 
     correctness_summary = (
-        filtered.groupby("is_correct", as_index=False)
+        filtered.groupby(["is_correct", "xai_method"], as_index=False)
         .agg(Samples=("sample_id", "nunique"), Mean=("metric_value", "mean"), Median=("metric_value", "median"))
         .replace({"is_correct": {True: "Correct", False: "Incorrect"}})
         .rename(columns={"is_correct": "Prediction"})
     )
     st.subheader("Correct vs incorrect predictions")
     st.dataframe(
-        correctness_summary.style.format({"Mean": "{:.4f}", "Median": "{:.4f}"}),
+        correctness_summary.style.format({"Mean": display_format, "Median": display_format}),
         use_container_width=True,
         hide_index=True,
     )
@@ -213,6 +266,14 @@ def show_xai(
         return
 
     model = get_xai_model(model_name)
+    _, parity_tensor = preprocess_pil_for_torch(image)
+    with torch.no_grad():
+        xai_grade = int(model(parity_tensor).argmax(dim=1).item())
+    if xai_grade != int(prediction["grade"]):
+        st.error(
+            f"XAI stopped: ONNX prediction is KL{prediction['grade']}, but the PyTorch XAI checkpoint predicts KL{xai_grade}."
+        )
+        return
     results = []
     with st.spinner("Generating visual explanations..."):
         for method in methods:
@@ -243,17 +304,13 @@ def show_xai(
         for column, result in zip(comparison_cols, results):
             column.image(result.overlay, caption=result.method, use_container_width=True)
 
-        pair_metrics, focus_metrics, similarity_matrix, average_score = build_xai_metrics(results)
+        pair_metrics, similarity_matrix, average_score = build_xai_metrics(results)
 
         st.subheader("Quantitative XAI comparison")
-        metric_cols = st.columns(2)
-        metric_cols[0].dataframe(pair_metrics.style.format({
+        st.dataframe(pair_metrics.style.format({
             "Pearson correlation": "{:.3f}",
             "Top 20% IoU": "{:.3f}",
             "Agreement score": "{:.3f}",
-        }), use_container_width=True, hide_index=True)
-        metric_cols[1].dataframe(focus_metrics.style.format({
-            "Focus area ratio": "{:.3f}",
         }), use_container_width=True, hide_index=True)
 
         st.metric("Average XAI Agreement Score", f"{average_score:.3f}")
@@ -303,6 +360,50 @@ def show_xai(
     )
     st.metric("Average Stability Score", f"{average_stability:.3f}")
     st.write(interpret_stability(average_stability))
+
+    st.subheader("Quantus evaluation (exploratory)")
+    st.caption("Runs only when requested. This quick profile uses 2 perturbation samples and is not a dataset-level research result.")
+    if st.button("Evaluate selected XAI methods", key=f"quantus-{model_name}-{','.join(methods)}"):
+        random.seed(42)
+        np.random.seed(42)
+        torch.manual_seed(42)
+        _, input_tensor = preprocess_pil_for_torch(image)
+        score_rows = []
+        try:
+            with st.spinner("Evaluating Quantus metrics for the selected explanations..."):
+                for result in results:
+                    for score in evaluate_quantus_metrics(
+                        model=model,
+                        input_tensor=input_tensor,
+                        attribution=result.raw_attribution,
+                        target_class=result.class_idx,
+                        xai_method=result.method,
+                        model_name=model_name,
+                        infidelity_samples=2,
+                        max_sensitivity_samples=2,
+                    ):
+                        score_rows.append({
+                            "XAI method": result.method,
+                            "Metric": score.metric_name,
+                            "Direction": f"{score.score_direction.title()} is better",
+                            "Value": score.value,
+                            "Parameters": score.parameters,
+                        })
+        except Exception as exc:
+            st.error(f"Quantus evaluation failed: {exc}")
+            return
+
+        quantus_results = pd.DataFrame(score_rows)
+        for metric_name, metric_rows in quantus_results.groupby("Metric", sort=False):
+            definition = metric_definition(metric_name)
+            st.markdown(f"**{metric_name} — {definition.interpretation if definition else ''}**")
+            st.dataframe(
+                metric_rows.drop(columns="Parameters").style.format({"Value": definition.display_format if definition else "{:.4f}"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+            with st.expander(f"{metric_name} configuration"):
+                st.json(metric_rows.iloc[0]["Parameters"])
 
 
 def main() -> None:

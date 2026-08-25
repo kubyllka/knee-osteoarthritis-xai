@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 import numpy as np
 import pandas as pd
@@ -25,6 +26,9 @@ OPTIONAL_COLUMNS = (
     "seed",
     "checkpoint_version",
     "target_class",
+    "metric_source",
+    "score_direction",
+    "metric_parameters",
 )
 
 VALID_METRIC_CATEGORIES = frozenset(
@@ -141,6 +145,37 @@ def validate_research_results(results: pd.DataFrame) -> pd.DataFrame:
     for column in ("run_id", "split", "checkpoint_version"):
         if column in cleaned.columns:
             cleaned[column] = cleaned[column].astype("string").str.strip()
+
+    if "metric_source" in cleaned.columns:
+        _require_non_empty_text(cleaned, "metric_source")
+        invalid_sources = sorted(set(cleaned["metric_source"]) - {"quantus", "custom"})
+        if invalid_sources:
+            raise ResearchResultsValidationError(
+                "Column 'metric_source' must contain quantus or custom."
+            )
+
+    if "score_direction" in cleaned.columns:
+        _require_non_empty_text(cleaned, "score_direction")
+        cleaned["score_direction"] = cleaned["score_direction"].str.lower()
+        invalid_directions = sorted(set(cleaned["score_direction"]) - {"higher", "lower"})
+        if invalid_directions:
+            raise ResearchResultsValidationError(
+                "Column 'score_direction' must contain higher or lower."
+            )
+
+    if "metric_parameters" in cleaned.columns:
+        for value in cleaned["metric_parameters"].dropna():
+            try:
+                parsed = json.loads(str(value))
+            except json.JSONDecodeError as exc:
+                raise ResearchResultsValidationError(
+                    "Column 'metric_parameters' must contain JSON objects."
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ResearchResultsValidationError(
+                    "Column 'metric_parameters' must contain JSON objects."
+                )
+        cleaned["metric_parameters"] = cleaned["metric_parameters"].astype("string").str.strip()
 
     return cleaned
 

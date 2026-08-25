@@ -10,24 +10,37 @@ MPL_CACHE_DIR = PROJECT_ROOT / ".cache" / "matplotlib"
 MPL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(MPL_CACHE_DIR))
 
-import quantus
-
 from app.xai import generate_xai_attributions
+from app.metric_registry import METRIC_REGISTRY
 
 
 @dataclass(frozen=True)
 class QuantusScore:
     metric_name: str
     metric_category: str
-    higher_is_better: bool
+    score_direction: str
     value: float
+    parameters: dict
 
 
-QUANTUS_METRIC_METADATA = {
-    "Infidelity": {"metric_category": "faithfulness", "higher_is_better": False},
-    "MaxSensitivity": {"metric_category": "robustness", "higher_is_better": False},
-    "Sparseness": {"metric_category": "complexity", "higher_is_better": True},
-}
+QUANTUS_METRIC_METADATA = METRIC_REGISTRY
+
+
+def _load_quantus():
+    """Import Quantus only when an on-demand evaluation is requested.
+
+    This keeps Prediction and Research views usable on managed Windows machines
+    where an application-control policy blocks a SciPy native DLL.
+    """
+    try:
+        import quantus
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(
+            "Quantus could not start because Windows blocked a required SciPy DLL. "
+            "Prediction and Research Mode remain available; run Quantus in an approved "
+            "Python/GPU environment or ask the system administrator to allow SciPy."
+        ) from exc
+    return quantus
 
 
 def _first_score(scores) -> float:
@@ -57,6 +70,7 @@ def evaluate_quantus_metrics(
     if attribution.ndim != 2:
         raise ValueError("attribution must have shape (height, width)")
 
+    quantus = _load_quantus()
     model.eval()
     x_batch = input_tensor.detach().cpu().numpy().astype(np.float32)
     y_batch = np.asarray([target_class], dtype=np.int64)
@@ -77,6 +91,9 @@ def evaluate_quantus_metrics(
         "Infidelity": quantus.Infidelity(
             perturb_patch_sizes=[patch_size],
             n_perturb_samples=infidelity_samples,
+            # The input is ImageNet-normalised, so an explicit mean baseline is
+            # clearer and more reproducible than calling normalised zero "black".
+            perturb_baseline="mean",
             disable_warnings=True,
         )(
             model=model,
@@ -109,12 +126,33 @@ def evaluate_quantus_metrics(
         ),
     }
 
+    parameters = {
+        "Infidelity": {
+            "attribution": "raw_scale_preserving",
+            "loss": "mse",
+            "n_perturb_samples": infidelity_samples,
+            "patch_size": patch_size,
+            "perturb_baseline": "mean",
+            "model_output": "logit",
+        },
+        "MaxSensitivity": {
+            "attribution": "raw_scale_preserving",
+            "nr_samples": max_sensitivity_samples,
+            "perturbation": "gaussian_noise",
+            "lower_bound": 0.05,
+            "upper_bound": None,
+            "model_output": "logit",
+        },
+        "Sparseness": {"attribution": "raw_scale_preserving"},
+    }
+
     return [
         QuantusScore(
             metric_name=name,
-            metric_category=QUANTUS_METRIC_METADATA[name]["metric_category"],
-            higher_is_better=QUANTUS_METRIC_METADATA[name]["higher_is_better"],
+            metric_category=QUANTUS_METRIC_METADATA[name].category,
+            score_direction=QUANTUS_METRIC_METADATA[name].score_direction,
             value=_first_score(score),
+            parameters=parameters[name],
         )
         for name, score in metric_scores.items()
     ]

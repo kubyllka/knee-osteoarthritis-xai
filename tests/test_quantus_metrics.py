@@ -21,19 +21,26 @@ class QuantusMetricsTests(unittest.TestCase):
         model = TinyClassifier()
         input_tensor = torch.arange(48, dtype=torch.float32).reshape(1, 3, 4, 4) / 47
 
-        scores = evaluate_quantus_metrics(
-            model=model,
-            input_tensor=input_tensor,
-            attribution=attribution,
-            target_class=0,
-            xai_method="Grad-CAM",
-            model_name="resnet50",
-            infidelity_samples=2,
-            max_sensitivity_samples=2,
-        )
+        try:
+            scores = evaluate_quantus_metrics(
+                model=model,
+                input_tensor=input_tensor,
+                attribution=attribution,
+                target_class=0,
+                xai_method="Grad-CAM",
+                model_name="resnet50",
+                infidelity_samples=2,
+                max_sensitivity_samples=2,
+            )
+        except RuntimeError as exc:
+            if "Windows blocked" in str(exc):
+                self.skipTest(str(exc))
+            raise
 
         self.assertEqual([score.metric_name for score in scores], ["Infidelity", "MaxSensitivity", "Sparseness"])
         self.assertTrue(all(np.isfinite(score.value) for score in scores))
+        self.assertEqual(scores[0].score_direction, "lower")
+        self.assertEqual(scores[0].parameters["attribution"], "raw_scale_preserving")
         self.assertEqual(mock_attributions.call_count, 2)
 
 

@@ -28,6 +28,7 @@ class XAIResult:
     heatmap: Image.Image
     overlay: Image.Image
     cam: np.ndarray
+    raw_attribution: np.ndarray
     method: str
     class_idx: int
 
@@ -184,7 +185,7 @@ class ActivationXAI:
         average_gradients = total_gradients / steps
         attribution = (input_tensor - baseline) * average_gradients
         saliency = attribution.abs().sum(dim=1).squeeze(0)
-        return normalize_cam(saliency.cpu().numpy())
+        return saliency.cpu().numpy()
 
     def _smooth_grad(
         self,
@@ -208,14 +209,14 @@ class ActivationXAI:
             total_saliency += noisy_input.grad.detach().abs().mean(dim=1, keepdim=True)
 
         saliency = (total_saliency / samples).squeeze(0).squeeze(0)
-        return normalize_cam(saliency.cpu().numpy())
+        return saliency.cpu().numpy()
 
     def _grad_cam(self, activations: torch.Tensor, gradients: torch.Tensor) -> np.ndarray:
         activations = self.reshape_transform(activations)
         gradients = self.reshape_transform(gradients)
         weights = gradients.mean(dim=(2, 3), keepdim=True)
         cam = (weights * activations).sum(dim=1).squeeze(0)
-        return normalize_cam(torch.relu(cam).cpu().numpy())
+        return torch.relu(cam).cpu().numpy()
 
     def _grad_cam_plus_plus(self, activations: torch.Tensor, gradients: torch.Tensor) -> np.ndarray:
         activations = self.reshape_transform(activations)
@@ -228,7 +229,7 @@ class ActivationXAI:
         alpha = grad_2 / (denominator + 1e-8)
         weights = (alpha * torch.relu(gradients)).sum(dim=(2, 3), keepdim=True)
         cam = (weights * activations).sum(dim=1).squeeze(0)
-        return normalize_cam(torch.relu(cam).cpu().numpy())
+        return torch.relu(cam).cpu().numpy()
 
     def _eigen_cam(self, activations: torch.Tensor) -> np.ndarray:
         activations = self.reshape_transform(activations).squeeze(0)
@@ -240,13 +241,19 @@ class ActivationXAI:
         cam = vh[0].reshape(height, width)
         if abs(cam.min()) > abs(cam.max()):
             cam = -cam
-        return normalize_cam(np.maximum(cam, 0.0))
+        return np.maximum(cam, 0.0)
+
+
+def resize_attribution(attribution: np.ndarray) -> np.ndarray:
+    """Resize an attribution without changing its numerical scale."""
+    return cv2.resize(attribution, (IMAGE_SIZE, IMAGE_SIZE)).astype(np.float32)
 
 
 def normalize_cam(cam: np.ndarray) -> np.ndarray:
-    cam = cv2.resize(cam, (IMAGE_SIZE, IMAGE_SIZE))
-    cam = cam - cam.min()
-    return cam / (cam.max() + 1e-8)
+    """Create a 0-1 display map; never use this visual normalisation for Quantus."""
+    resized = resize_attribution(cam)
+    resized = resized - resized.min()
+    return resized / (resized.max() + 1e-8)
 
 
 def colorize_cam(original: Image.Image, cam: np.ndarray, alpha: float = 0.45) -> tuple[Image.Image, Image.Image]:
@@ -270,16 +277,18 @@ def generate_xai_visualization(
     target_layer, reshape_transform = get_target_layer_and_transform(model, model_name)
     explainer = ActivationXAI(model, target_layer, reshape_transform)
     try:
-        cam, explained_class = explainer.generate(input_tensor, method=method, class_idx=class_idx)
+        raw_attribution, explained_class = explainer.generate(input_tensor, method=method, class_idx=class_idx)
     finally:
         explainer.remove_hooks()
 
+    cam = normalize_cam(raw_attribution)
     heatmap, overlay = colorize_cam(original, cam, alpha=alpha)
     return XAIResult(
         original=original,
         heatmap=heatmap,
         overlay=overlay,
         cam=cam,
+        raw_attribution=resize_attribution(raw_attribution),
         method=method,
         class_idx=explained_class,
     )
@@ -292,7 +301,7 @@ def generate_xai_attributions(
     method: str,
     model_name: str,
 ) -> np.ndarray:
-    """Generate raw attribution maps for a NumPy batch, as required by evaluation libraries."""
+    """Generate raw, scale-preserving attribution maps for evaluation libraries."""
     if inputs.ndim != 4:
         raise ValueError("inputs must have shape (batch, channels, height, width)")
     if len(inputs) != len(targets):
@@ -305,12 +314,12 @@ def generate_xai_attributions(
     try:
         for input_array, target in zip(inputs, targets):
             input_tensor = torch.from_numpy(input_array).unsqueeze(0).to(device=device, dtype=torch.float32)
-            cam, _ = explainer.generate(
+            raw_attribution, _ = explainer.generate(
                 input_tensor,
                 method=method,
                 class_idx=int(target),
             )
-            cams.append(cam)
+            cams.append(resize_attribution(raw_attribution))
     finally:
         explainer.remove_hooks()
 

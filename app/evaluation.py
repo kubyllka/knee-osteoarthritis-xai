@@ -46,11 +46,6 @@ def mask_iou(first_mask: np.ndarray, second_mask: np.ndarray) -> float:
     return float(intersection / union)
 
 
-def focus_area_ratio(cam: np.ndarray, top_fraction: float = TOP_PIXEL_FRACTION) -> float:
-    """Report how much of the image belongs to the high-activation explanation region."""
-    return float(binary_top_mask(cam, top_fraction).mean())
-
-
 def agreement_score(correlation: float, iou: float) -> float:
     # Correlation can be negative; clipping maps it onto the same 0-1 range as IoU.
     normalized_correlation = max(0.0, min(1.0, correlation))
@@ -73,16 +68,8 @@ def slightly_perturb_image(image: Image.Image) -> Image.Image:
     return perturbed
 
 
-def build_xai_metrics(results: Sequence) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, float]:
+def build_xai_metrics(results: Sequence) -> tuple[pd.DataFrame, pd.DataFrame, float]:
     masks = {result.method: binary_top_mask(result.cam) for result in results}
-
-    focus_rows = [
-        {
-            "Method": result.method,
-            "Focus area ratio": focus_area_ratio(result.cam),
-        }
-        for result in results
-    ]
 
     pair_rows = []
     agreement_scores = []
@@ -114,7 +101,6 @@ def build_xai_metrics(results: Sequence) -> tuple[pd.DataFrame, pd.DataFrame, pd
     average_score = float(np.mean(agreement_scores)) if agreement_scores else 1.0
     return (
         pd.DataFrame(pair_rows),
-        pd.DataFrame(focus_rows),
         similarity_matrix,
         average_score,
     )

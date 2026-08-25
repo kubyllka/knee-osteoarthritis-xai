@@ -1,16 +1,20 @@
 import argparse
+import random
 import sys
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
+import torch
 from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import MODEL_CONFIGS
-from app.evaluation import build_deletion_metrics, build_stability_metrics, focus_area_ratio
+from app.evaluation import build_deletion_metrics, build_stability_metrics
+from app.metric_registry import metric_definition, serialise_parameters
 from app.inference import ONNXKneeOsteoarthritisClassifier
 from app.quantus_metrics import QuantusScore, evaluate_quantus_metrics
 from app.research.manifest import DatasetSample, load_dataset_manifest
@@ -19,6 +23,13 @@ from app.xai import generate_xai_visualization, load_xai_model_by_name, preproce
 
 
 DEFAULT_METHODS = ["Grad-CAM", "SmoothGrad"]
+
+
+def set_research_seed(seed: int) -> None:
+    """Seed every random generator used by the current CPU research pipeline."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def prediction_to_dict(prediction) -> dict:
@@ -49,6 +60,9 @@ def metric_row(
     run_id: str,
     seed: int,
     checkpoint_version: str,
+    metric_source: str,
+    score_direction: str,
+    metric_parameters: dict,
 ) -> dict:
     predicted_kl = int(prediction["grade"])
     return {
@@ -69,6 +83,9 @@ def metric_row(
         "seed": seed,
         "checkpoint_version": checkpoint_version,
         "target_class": predicted_kl,
+        "metric_source": metric_source,
+        "score_direction": score_direction,
+        "metric_parameters": serialise_parameters(metric_parameters),
     }
 
 
@@ -100,6 +117,8 @@ def custom_metric_rows(
         model_name=model_name,
     )
 
+    deletion_definition = metric_definition("Deletion confidence drop")
+    stability_definition = metric_definition("Stability score")
     return [
         metric_row(
             sample,
@@ -112,6 +131,9 @@ def custom_metric_rows(
             run_id,
             seed,
             checkpoint_version,
+            deletion_definition.source,
+            deletion_definition.score_direction,
+            {"masking": "top_20_percent", "replacement": "image_mean"},
         ),
         metric_row(
             sample,
@@ -124,18 +146,9 @@ def custom_metric_rows(
             run_id,
             seed,
             checkpoint_version,
-        ),
-        metric_row(
-            sample,
-            prediction,
-            model_name,
-            xai_result.method,
-            "Focus area ratio",
-            "custom",
-            focus_area_ratio(xai_result.cam),
-            run_id,
-            seed,
-            checkpoint_version,
+            stability_definition.source,
+            stability_definition.score_direction,
+            {"brightness_multiplier": 1.05, "contrast_multiplier": 1.05},
         ),
     ]
 
@@ -162,6 +175,9 @@ def quantus_metric_rows(
             run_id,
             seed,
             checkpoint_version,
+            "quantus",
+            score.score_direction,
+            score.parameters,
         )
         for score in scores
     ]
@@ -178,6 +194,7 @@ def run_research(
     infidelity_samples: int,
     max_sensitivity_samples: int,
 ) -> pd.DataFrame:
+    set_research_seed(seed)
     samples = load_dataset_manifest(manifest_path)
     if limit is not None:
         samples = samples[:limit]
@@ -195,6 +212,13 @@ def run_research(
         prediction = prediction_to_dict(classifier.predict(image_bytes))
         image = Image.open(sample.image_path).convert("RGB")
         _, input_tensor = preprocess_pil_for_torch(image)
+        with torch.no_grad():
+            xai_prediction = int(xai_model(input_tensor).argmax(dim=1).item())
+        if xai_prediction != int(prediction["grade"]):
+            raise RuntimeError(
+                f"Prediction mismatch for {sample.sample_id}: ONNX predicted KL{prediction['grade']}, "
+                f"but the PyTorch XAI checkpoint predicted KL{xai_prediction}."
+            )
         print(
             f"[{sample_index}/{len(samples)}] {sample.sample_id}: "
             f"true KL{sample.true_kl}, predicted KL{prediction['grade']}"
@@ -211,7 +235,7 @@ def run_research(
             quantus_scores = evaluate_quantus_metrics(
                 model=xai_model,
                 input_tensor=input_tensor,
-                attribution=xai_result.cam,
+                attribution=xai_result.raw_attribution,
                 target_class=xai_result.class_idx,
                 xai_method=method,
                 model_name=model_name,
