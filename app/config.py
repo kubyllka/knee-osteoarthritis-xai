@@ -7,6 +7,8 @@ ONNX_MODEL_PATH = MODEL_DIR / "vit_kl.onnx"
 PYTORCH_CHECKPOINT_PATH = MODEL_DIR / "vit_phase2_best.pth"
 RESNET_ONNX_MODEL_PATH = MODEL_DIR / "resnet50_kl.onnx"
 RESNET_PYTORCH_CHECKPOINT_PATH = MODEL_DIR / "resnet50_phase2_best.pth"
+DENSENET_ONNX_MODEL_PATH = MODEL_DIR / "densenet121_kl.onnx"
+DENSENET_PYTORCH_CHECKPOINT_PATH = MODEL_DIR / "densenet121_finetune_block3_4_best.pth"
 
 MODEL_CONFIGS = {
     "vit": {
@@ -18,6 +20,11 @@ MODEL_CONFIGS = {
         "display_name": "ResNet-50",
         "onnx_path": RESNET_ONNX_MODEL_PATH,
         "checkpoint_path": RESNET_PYTORCH_CHECKPOINT_PATH,
+    },
+    "densenet121": {
+        "display_name": "DenseNet-121",
+        "onnx_path": DENSENET_ONNX_MODEL_PATH,
+        "checkpoint_path": DENSENET_PYTORCH_CHECKPOINT_PATH,
     },
 }
 

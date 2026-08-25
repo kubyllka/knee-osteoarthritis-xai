@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+import pickle
 
 import cv2
 import numpy as np
@@ -15,6 +16,7 @@ from app.config import (
     PYTORCH_CHECKPOINT_PATH,
 )
 from app.model_definition import (
+    create_densenet121_model,
     create_resnet50_model,
     create_vit_model,
     identity_reshape_transform,
@@ -34,10 +36,18 @@ class XAIResult:
 
 
 def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path) -> torch.nn.Module:
+    """Load a local, trusted training checkpoint into an XAI model.
+
+    Newer PyTorch releases default to ``weights_only=True``. Older training
+    checkpoints may contain harmless NumPy scalar metadata alongside weights,
+    which requires the trusted-file fallback below.
+    """
     try:
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     except TypeError:
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    except pickle.UnpicklingError:
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
         checkpoint = checkpoint["state_dict"]
@@ -55,13 +65,24 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path) -> torch.nn.M
 def create_xai_model(model_name: str) -> torch.nn.Module:
     if model_name == "resnet50":
         return create_resnet50_model(num_classes=NUM_CLASSES, freeze_backbone=False)
-    return create_vit_model(num_classes=NUM_CLASSES, freeze_backbone=False)
+    if model_name == "densenet121":
+        return create_densenet121_model(num_classes=NUM_CLASSES, freeze_backbone=False)
+    if model_name == "vit":
+        return create_vit_model(num_classes=NUM_CLASSES, freeze_backbone=False)
+    raise ValueError(f"Unsupported model name: {model_name}")
 
 
 def get_target_layer_and_transform(model: torch.nn.Module, model_name: str):
     if model_name == "resnet50":
         return model.layer4[-1], identity_reshape_transform
-    return model.encoder.layers[-1].ln_1, vit_reshape_transform
+    if model_name == "densenet121":
+        # DenseNet applies an in-place ReLU immediately after norm5. A full
+        # backward hook on norm5 conflicts with that operation in PyTorch, so
+        # use the preceding final dense block as the Grad-CAM target instead.
+        return model.features.denseblock4, identity_reshape_transform
+    if model_name == "vit":
+        return model.encoder.layers[-1].ln_1, vit_reshape_transform
+    raise ValueError(f"Unsupported model name: {model_name}")
 
 
 def load_xai_model(

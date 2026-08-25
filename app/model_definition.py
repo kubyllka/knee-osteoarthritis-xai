@@ -48,6 +48,27 @@ def create_resnet50_model(num_classes=5, freeze_backbone=True):
     return model
 
 
+def create_densenet121_model(num_classes=5, freeze_backbone=True):
+    """Create a standard DenseNet-121 with a KL-grade classification head."""
+    model = models.densenet121(weights=None)
+
+    if freeze_backbone:
+        for param in model.parameters():
+            param.requires_grad = False
+
+    num_features = model.classifier.in_features
+    # The local DenseNet checkpoint stores a 512-unit fine-tuning head.
+    # Dropout is inactive for inference and XAI because the model is in eval mode.
+    model.classifier = nn.Sequential(
+        nn.Dropout(0.5),
+        nn.Linear(num_features, 512),
+        nn.ReLU(),
+        nn.Dropout(0.3),
+        nn.Linear(512, num_classes),
+    )
+    return model
+
+
 def vit_reshape_transform(tensor, height=14, width=14):
     result = tensor[:, 1:, :].reshape(tensor.size(0), height, width, tensor.size(2))
     return result.permute(0, 3, 1, 2)

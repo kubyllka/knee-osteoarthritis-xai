@@ -59,6 +59,15 @@ Place images listed in `inputs/manifest.json` locally, ensure the corresponding 
 
 The runner writes a validated CSV to `results/research/`. Use a GPU-enabled environment for larger experiments. The small one-image / one-perturbation command is a pipeline check only; it is not sufficient for scientific conclusions.
 
+To add DenseNet-121, place its checkpoint at `models/densenet121_finetune_block3_4_best.pth` and export the matching ONNX file:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\export_to_onnx.py --architecture densenet121
+```
+
+The expected ONNX output path is `models/densenet121_kl.onnx`; DenseNet-121 will then appear in the application model selector.
+Only export checkpoints you trust: older PyTorch checkpoints can contain training metadata and require trusted deserialisation during export.
+
 ## Notes on XAI evaluation
 
 Metric values should be compared only within the same model, dataset split, XAI configuration, and Quantus configuration. In particular, Infidelity is an MSE-based lower-is-better metric and can have values much larger than 1. No individual metric alone establishes explanation quality.

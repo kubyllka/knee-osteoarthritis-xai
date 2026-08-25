@@ -385,7 +385,6 @@ def show_xai(
                         score_rows.append({
                             "XAI method": result.method,
                             "Metric": score.metric_name,
-                            "Direction": f"{score.score_direction.title()} is better",
                             "Value": score.value,
                             "Parameters": score.parameters,
                         })
@@ -396,9 +395,18 @@ def show_xai(
         quantus_results = pd.DataFrame(score_rows)
         for metric_name, metric_rows in quantus_results.groupby("Metric", sort=False):
             definition = metric_definition(metric_name)
-            st.markdown(f"**{metric_name} — {definition.interpretation if definition else ''}**")
+            direction = (
+                f"{definition.score_direction.title()} is better"
+                if definition is not None
+                else "See experiment documentation for interpretation"
+            )
+            st.markdown(f"**{metric_name} - {direction}**")
+            if definition is not None:
+                st.caption(definition.description)
             st.dataframe(
-                metric_rows.drop(columns="Parameters").style.format({"Value": definition.display_format if definition else "{:.4f}"}),
+                metric_rows[["XAI method", "Value"]].style.format(
+                    {"Value": definition.display_format if definition else "{:.4f}"}
+                ),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -445,7 +453,7 @@ def main() -> None:
     image_bytes = uploaded_file.getvalue()
     image = Image.open(BytesIO(image_bytes)).convert("RGB")
 
-    image_col, result_col = st.columns([1, 1])
+    image_col, result_col = st.columns([0.65, 1.35])
     with image_col:
         st.image(image, caption="Uploaded image", use_container_width=True)
 
