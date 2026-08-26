@@ -164,31 +164,75 @@ def _selected_metric_rows(frame: pd.DataFrame, metric_name: str) -> pd.DataFrame
     return selected
 
 
-def _metric_chart(frame: pd.DataFrame, x_field: str, x_title: str, definition, display_format: str):
+def _median_by_method_and_grade(frame: pd.DataFrame, definition) -> pd.DataFrame:
+    """One comparable median per method and true KL grade for the dashboard heatmap."""
+    summary = _summary_by(frame, ["xai_method", "true_kl"])
+    method_order = (
+        summary.groupby("xai_method", as_index=False)["Median"].median()
+        .sort_values("Median", ascending=definition.score_direction == "lower")["xai_method"]
+        .tolist()
+    )
+    summary["KL grade"] = summary["true_kl"].map(lambda grade: f"KL{grade}")
+    summary["xai_method"] = pd.Categorical(summary["xai_method"], categories=method_order, ordered=True)
+    return summary
+
+
+def _median_heatmap(frame: pd.DataFrame, definition, display_format: str):
+    summary = _median_by_method_and_grade(frame, definition)
+    summary["Median label"] = summary["Median"].map(lambda value: display_format.format(value))
     metric_name = frame["metric_name"].iloc[0]
-    y = alt.Y("metric_value:Q", title=metric_name, scale=_metric_scale(metric_name))
-    tooltip = [
-        "sample_id:N", "xai_method:N", "true_kl:O", "predicted_kl:O",
-        alt.Tooltip("metric_value:Q", title="Value", format=_metric_tooltip_format(display_format)),
-    ]
-    boxplot = alt.Chart(frame).mark_boxplot(size=28, opacity=0.45).encode(
-        x=alt.X(f"{x_field}:N", title=x_title, sort=["0", "1", "2", "3", "4"] if x_field == "true_kl" else None),
-        xOffset=alt.XOffset("xai_method:N"),
-        y=y,
-        color=alt.Color("xai_method:N", title="XAI method"),
+    color_scale = alt.Scale(domain=[-1, 1], scheme="redblue") if metric_name == "FaithfulnessCorrelation" else alt.Scale(scheme="blues")
+    rect = alt.Chart(summary).mark_rect(cornerRadius=3).encode(
+        x=alt.X("KL grade:O", title="True KL grade", sort=["KL0", "KL1", "KL2", "KL3", "KL4"]),
+        y=alt.Y("xai_method:N", title="XAI method", sort=summary["xai_method"].cat.categories.tolist()),
+        color=alt.Color("Median:Q", title="Median score", scale=color_scale),
+        tooltip=[
+            "xai_method:N",
+            "KL grade:O",
+            "Samples:Q",
+            alt.Tooltip("Median:Q", format=_metric_tooltip_format(display_format)),
+            alt.Tooltip("IQR:Q", format=_metric_tooltip_format(display_format)),
+        ],
     )
-    points = alt.Chart(frame).mark_circle(size=58, opacity=0.78).encode(
-        x=alt.X(f"{x_field}:N", title=x_title, sort=["0", "1", "2", "3", "4"] if x_field == "true_kl" else None),
-        xOffset=alt.XOffset("xai_method:N"),
-        y=y,
-        color=alt.Color("xai_method:N", title="XAI method"),
-        tooltip=tooltip,
+    labels = alt.Chart(summary).mark_text(fontSize=12).encode(
+        x=alt.X("KL grade:O", sort=["KL0", "KL1", "KL2", "KL3", "KL4"]),
+        y=alt.Y("xai_method:N", sort=summary["xai_method"].cat.categories.tolist()),
+        text="Median label:N",
     )
-    chart = boxplot + points
-    if metric_name == "FaithfulnessCorrelation":
-        zero = alt.Chart(pd.DataFrame({"zero": [0]})).mark_rule(color="#777", strokeDash=[5, 4]).encode(y="zero:Q")
-        chart = zero + chart
-    return chart.properties(height=350)
+    return (rect + labels).properties(height=max(150, 42 * len(summary["xai_method"].cat.categories)))
+
+
+def _outcome_heatmap(frame: pd.DataFrame, definition, display_format: str):
+    """Method-by-outcome medians without mixing metrics or drawing fragile facets."""
+    summary = _summary_by(frame, ["xai_method", "is_correct"])
+    summary["Prediction outcome"] = summary["is_correct"].map({False: "Incorrect", True: "Correct"})
+    method_order = (
+        summary.groupby("xai_method", as_index=False)["Median"].median()
+        .sort_values("Median", ascending=definition.score_direction == "lower")["xai_method"]
+        .tolist()
+    )
+    summary["xai_method"] = pd.Categorical(summary["xai_method"], categories=method_order, ordered=True)
+    summary["Median label"] = summary["Median"].map(lambda value: display_format.format(value))
+    metric_name = frame["metric_name"].iloc[0]
+    color_scale = alt.Scale(domain=[-1, 1], scheme="redblue") if metric_name == "FaithfulnessCorrelation" else alt.Scale(scheme="blues")
+    rect = alt.Chart(summary).mark_rect(cornerRadius=3).encode(
+        x=alt.X("Prediction outcome:O", title="Prediction outcome", sort=["Incorrect", "Correct"]),
+        y=alt.Y("xai_method:N", title="XAI method", sort=method_order),
+        color=alt.Color("Median:Q", title="Median score", scale=color_scale),
+        tooltip=[
+            "xai_method:N",
+            "Prediction outcome:O",
+            "Samples:Q",
+            alt.Tooltip("Median:Q", format=_metric_tooltip_format(display_format)),
+            alt.Tooltip("IQR:Q", format=_metric_tooltip_format(display_format)),
+        ],
+    )
+    labels = alt.Chart(summary).mark_text(fontSize=12).encode(
+        x=alt.X("Prediction outcome:O", sort=["Incorrect", "Correct"]),
+        y=alt.Y("xai_method:N", sort=method_order),
+        text="Median label:N",
+    )
+    return (rect + labels).properties(height=max(150, 42 * len(method_order)))
 
 
 def _summary_card_values(filtered: pd.DataFrame, definition) -> dict[str, object]:
@@ -258,16 +302,18 @@ def _show_metric_dashboard(filtered: pd.DataFrame, selected_metric: str) -> None
     if group_summary["Samples"].min() < 10:
         st.warning("Small-sample comparison: at least one KL × method group has fewer than 10 images. Inspect patterns, but do not draw statistical conclusions.")
 
-    st.subheader("XAI quality by true KL grade")
-    st.caption("Each point is one image. Boxes summarise the distribution for each KL grade and XAI method.")
-    st.altair_chart(_metric_chart(filtered, "true_kl", "True KL grade", definition, display_format), use_container_width=True)
+    st.subheader("Median XAI score by true KL grade")
+    st.caption("Each cell is the median for one XAI method and KL grade. Hover for sample count and IQR; do not compare different metrics with each other.")
+    st.altair_chart(_median_heatmap(filtered, definition, display_format), use_container_width=True)
 
-    st.subheader("Correct vs incorrect predictions")
-    correctness_frame = filtered.assign(prediction_group=np.where(filtered["is_correct"], "Correct", "Incorrect"))
-    if correctness_frame["prediction_group"].nunique() < 2:
+    st.subheader("Median XAI score: correct vs incorrect predictions")
+    if filtered["is_correct"].nunique() < 2:
         st.info("No correct-vs-incorrect comparison is available under the active filters because all selected images have the same prediction outcome.")
     else:
-        st.altair_chart(_metric_chart(correctness_frame, "prediction_group", "Prediction outcome", definition, display_format), use_container_width=True)
+        st.altair_chart(
+            _outcome_heatmap(filtered, definition, display_format),
+            use_container_width=True,
+        )
 
     st.subheader("KL grade × XAI method summary")
     summary = group_summary.rename(columns={"true_kl": "True KL grade"})

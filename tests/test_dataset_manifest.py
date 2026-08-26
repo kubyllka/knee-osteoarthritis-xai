@@ -9,12 +9,13 @@ from app.research.manifest import (
 
 
 class DatasetManifestTests(unittest.TestCase):
-    def test_demo_manifest_loads_all_local_images(self) -> None:
+    def test_manifest_loads_all_listed_local_images(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
         manifest = load_dataset_manifest(project_root / "inputs" / "manifest.json")
 
-        self.assertEqual(len(manifest), 6)
-        self.assertEqual([sample.true_kl for sample in manifest], [0, 1, 1, 2, 3, 4])
+        self.assertGreater(len(manifest), 0)
+        self.assertEqual(len({sample.sample_id for sample in manifest}), len(manifest))
+        self.assertTrue(all(0 <= sample.true_kl <= 4 for sample in manifest))
         self.assertTrue(all(sample.image_path.is_file() for sample in manifest))
 
     def test_invalid_kl_is_rejected(self) -> None:

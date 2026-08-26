@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pandas as pd
 
 from app.metric_registry import metric_definition
-from streamlit_app import _selected_metric_rows, _summary_card_values
+from streamlit_app import _median_by_method_and_grade, _selected_metric_rows, _summary_card_values
 from scripts.run_research import (
     RUNNER_METRICS,
     _validate_resume_configuration,
@@ -71,6 +71,18 @@ class ResearchDashboardAndRunnerTests(unittest.TestCase):
         self.assertEqual(values["method"], "A")
         self.assertEqual(values["best_grade"], 0)
         self.assertEqual(values["worst_grade"], 1)
+
+    def test_heatmap_uses_one_median_per_method_and_kl_grade(self) -> None:
+        rows = pd.DataFrame(
+            [
+                {"sample_id": "one", "xai_method": "A", "true_kl": 0, "metric_value": 0.2},
+                {"sample_id": "two", "xai_method": "A", "true_kl": 0, "metric_value": 0.6},
+                {"sample_id": "three", "xai_method": "B", "true_kl": 0, "metric_value": 0.1},
+            ]
+        )
+        summary = _median_by_method_and_grade(rows, metric_definition("FaithfulnessCorrelation"))
+        self.assertEqual(len(summary), 2)
+        self.assertEqual(float(summary.loc[summary["xai_method"] == "A", "Median"].iloc[0]), 0.4)
 
 
 if __name__ == "__main__":
