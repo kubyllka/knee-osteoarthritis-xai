@@ -235,6 +235,16 @@ def _outcome_heatmap(frame: pd.DataFrame, definition, display_format: str):
     return (rect + labels).properties(height=max(150, 42 * len(method_order)))
 
 
+def _median_by_kl_bar_data(frame: pd.DataFrame) -> pd.DataFrame:
+    """Wide table used by Streamlit's reliable grouped-bar renderer."""
+    summary = _summary_by(frame, ["true_kl", "xai_method"])
+    summary["KL grade"] = summary["true_kl"].map(lambda grade: f"KL{grade}")
+    data = summary.pivot(index="KL grade", columns="xai_method", values="Median")
+    data = data.reindex(["KL0", "KL1", "KL2", "KL3", "KL4"])
+    data.index.name = "True KL grade"
+    return data
+
+
 def _summary_card_values(filtered: pd.DataFrame, definition) -> dict[str, object]:
     samples = filtered["sample_id"].nunique()
     sample_rows = filtered.drop_duplicates("sample_id")
@@ -302,6 +312,20 @@ def _show_metric_dashboard(filtered: pd.DataFrame, selected_metric: str) -> None
     if group_summary["Samples"].min() < 10:
         st.warning("Small-sample comparison: at least one KL × method group has fewer than 10 images. Inspect patterns, but do not draw statistical conclusions.")
 
+    st.subheader(f"Median {selected_metric} by true KL grade")
+    direction = (
+        "Higher values mean a more concentrated map; this is descriptive, not automatically better."
+        if definition.category == "complexity"
+        else "Lower values are better." if definition.score_direction == "lower" else "Higher values are better."
+    )
+    st.caption(f"Each bar is the median across images in one KL-grade × XAI-method group. {direction} N and IQR are available in the table below.")
+    st.bar_chart(
+        _median_by_kl_bar_data(filtered),
+        height=360,
+        stack=False,
+        use_container_width=True,
+    )
+
     st.subheader("Median XAI score by true KL grade")
     st.caption("Each cell is the median for one XAI method and KL grade. Hover for sample count and IQR; do not compare different metrics with each other.")
     st.altair_chart(_median_heatmap(filtered, definition, display_format), use_container_width=True)
@@ -310,10 +334,7 @@ def _show_metric_dashboard(filtered: pd.DataFrame, selected_metric: str) -> None
     if filtered["is_correct"].nunique() < 2:
         st.info("No correct-vs-incorrect comparison is available under the active filters because all selected images have the same prediction outcome.")
     else:
-        st.altair_chart(
-            _outcome_heatmap(filtered, definition, display_format),
-            use_container_width=True,
-        )
+        st.altair_chart(_outcome_heatmap(filtered, definition, display_format), use_container_width=True)
 
     st.subheader("KL grade × XAI method summary")
     summary = group_summary.rename(columns={"true_kl": "True KL grade"})
