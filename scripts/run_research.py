@@ -19,7 +19,7 @@ from app.inference import ONNXKneeOsteoarthritisClassifier
 from app.quantus_metrics import QuantusScore, evaluate_quantus_metrics
 from app.research.manifest import DatasetSample, load_dataset_manifest
 from app.research.results import load_research_results, validate_research_results
-from app.xai import generate_xai_visualization, load_xai_model_by_name, preprocess_pil_for_torch
+from app.xai import generate_xai_visualization, load_xai_model_by_name, predict_kl_with_xai_model, preprocess_pil_for_torch
 
 
 DEFAULT_METHODS = ["Grad-CAM", "SmoothGrad"]
@@ -149,6 +149,11 @@ def custom_metric_rows(
 
     deletion_definition = metric_definition("Deletion confidence drop")
     stability_definition = metric_definition("Stability score")
+    ordinal_parameters = (
+        {"model_output": "ordinal_class_probability", "xai_target": "predicted_kl_class_score"}
+        if MODEL_CONFIGS[model_name].get("output_type") == "ordinal_thresholds"
+        else {"model_output": "class_probability", "xai_target": "predicted_class_logit"}
+    )
     return [
         metric_row(
             sample,
@@ -163,7 +168,7 @@ def custom_metric_rows(
             checkpoint_version,
             deletion_definition.source,
             deletion_definition.score_direction,
-            {"masking": "top_20_percent", "replacement": "image_mean", "device": device_name},
+            {"masking": "top_20_percent", "replacement": "image_mean", "device": device_name, **ordinal_parameters},
         ),
         metric_row(
             sample,
@@ -178,7 +183,7 @@ def custom_metric_rows(
             checkpoint_version,
             stability_definition.source,
             stability_definition.score_direction,
-            {"brightness_multiplier": 1.05, "contrast_multiplier": 1.05, "device": device_name},
+            {"brightness_multiplier": 1.05, "contrast_multiplier": 1.05, "device": device_name, **ordinal_parameters},
         ),
     ]
 
@@ -306,7 +311,9 @@ def run_research(
         raise ValueError("No samples selected for the research run.")
 
     model_config = MODEL_CONFIGS[model_name]
-    classifier = ONNXKneeOsteoarthritisClassifier(model_config["onnx_path"])
+    classifier = ONNXKneeOsteoarthritisClassifier(
+        model_config["onnx_path"], output_type=model_config.get("output_type", "multiclass")
+    )
     xai_model = load_xai_model_by_name(model_name, device=selected_device)
     checkpoint_version = model_config["checkpoint_path"].name
     rows: list[dict] = []
@@ -337,7 +344,7 @@ def run_research(
         _, input_tensor = preprocess_pil_for_torch(image)
         input_tensor = input_tensor.to(selected_device)
         with torch.no_grad():
-            xai_prediction = int(xai_model(input_tensor).argmax(dim=1).item())
+            xai_prediction = predict_kl_with_xai_model(xai_model, input_tensor, model_name)
         if xai_prediction != int(prediction["grade"]):
             raise RuntimeError(
                 f"Prediction mismatch for {sample.sample_id}: ONNX predicted KL{prediction['grade']}, "

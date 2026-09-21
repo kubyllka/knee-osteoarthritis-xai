@@ -13,12 +13,19 @@ from app.config import (
     NUM_CLASSES,
     DENSENET_ONNX_MODEL_PATH,
     DENSENET_PYTORCH_CHECKPOINT_PATH,
+    MODEL_CONFIGS,
     ONNX_MODEL_PATH,
     PYTORCH_CHECKPOINT_PATH,
     RESNET_ONNX_MODEL_PATH,
     RESNET_PYTORCH_CHECKPOINT_PATH,
 )
-from app.model_definition import create_densenet121_model, create_resnet50_model, create_vit_model
+from app.model_definition import (
+    create_densenet121_model,
+    create_densenet121_ordinal_model,
+    create_resnet50_model,
+    create_resnet50_ordinal_model,
+    create_vit_model,
+)
 
 
 def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path) -> torch.nn.Module:
@@ -47,11 +54,13 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path) -> torch.nn.M
     return model
 
 
-def create_model(architecture: str, num_classes: int) -> torch.nn.Module:
+def create_model(architecture: str, num_classes: int, output_type: str = "multiclass") -> torch.nn.Module:
     if architecture == "resnet50":
-        return create_resnet50_model(num_classes=num_classes, freeze_backbone=True)
+        factory = create_resnet50_ordinal_model if output_type == "ordinal_thresholds" else create_resnet50_model
+        return factory(num_classes=num_classes, freeze_backbone=True)
     if architecture == "densenet121":
-        return create_densenet121_model(num_classes=num_classes, freeze_backbone=True)
+        factory = create_densenet121_ordinal_model if output_type == "ordinal_thresholds" else create_densenet121_model
+        return factory(num_classes=num_classes, freeze_backbone=True)
     if architecture == "vit":
         return create_vit_model(num_classes=num_classes, freeze_backbone=True)
     raise ValueError(f"Unsupported architecture: {architecture}")
@@ -62,10 +71,11 @@ def export_to_onnx(
     output_path: Path,
     num_classes: int,
     architecture: str,
+    output_type: str = "multiclass",
 ) -> None:
     output_path = Path(str(output_path).strip())
 
-    model = create_model(architecture=architecture, num_classes=num_classes)
+    model = create_model(architecture=architecture, num_classes=num_classes, output_type=output_type)
     model = load_checkpoint(model, checkpoint_path)
     model.eval()
 
@@ -119,4 +129,5 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    export_to_onnx(args.checkpoint, args.output, args.num_classes, args.architecture)
+    output_type = MODEL_CONFIGS.get(args.architecture, {}).get("output_type", "multiclass")
+    export_to_onnx(args.checkpoint, args.output, args.num_classes, args.architecture, output_type)

@@ -6,6 +6,7 @@ import numpy as np
 import onnxruntime as ort
 
 from app.config import KL_LABELS, ONNX_MODEL_PATH
+from app.ordinal import ordinal_class_probabilities_numpy, ordinal_logits_to_class_numpy
 from app.preprocessing import load_image, preprocess_image, softmax
 
 
@@ -19,7 +20,7 @@ class Prediction:
 
 
 class ONNXKneeOsteoarthritisClassifier:
-    def __init__(self, model_path: Path = ONNX_MODEL_PATH):
+    def __init__(self, model_path: Path = ONNX_MODEL_PATH, output_type: str = "multiclass"):
         if not model_path.exists():
             raise FileNotFoundError(
                 f"ONNX model not found: {model_path}. Run scripts/export_to_onnx.py first."
@@ -41,6 +42,7 @@ class ONNXKneeOsteoarthritisClassifier:
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
         self.providers = self.session.get_providers()
+        self.output_type = output_type
 
     def predict(self, image_bytes: bytes) -> Prediction:
         image = load_image(image_bytes)
@@ -51,8 +53,12 @@ class ONNXKneeOsteoarthritisClassifier:
         latency_ms = (perf_counter() - start) * 1000
 
         logits = outputs[0]
-        probabilities = softmax(logits)[0]
-        grade = int(np.argmax(probabilities))
+        if self.output_type == "ordinal_thresholds":
+            grade = int(ordinal_logits_to_class_numpy(logits)[0])
+            probabilities = ordinal_class_probabilities_numpy(logits)[0]
+        else:
+            probabilities = softmax(logits)[0]
+            grade = int(np.argmax(probabilities))
 
         return Prediction(
             grade=grade,

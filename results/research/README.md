@@ -25,6 +25,8 @@ New pipeline outputs also include `metric_source` (`quantus` or `custom`), `scor
 
 New runs use `FaithfulnessCorrelation` as the primary faithfulness metric. It ranges from -1 to 1, where higher is better, and uses a recorded, normalised attribution protocol. `Infidelity` may appear in older files only and is treated as legacy data. `MaxSensitivity` is lower-is-better; `Sparseness` is higher for more concentrated maps, not necessarily clinically better. Deletion confidence drop is displayed under Faithfulness and stability score under Robustness; both remain custom implementations. The `Custom checks` dashboard tab is intentionally empty until a future dataset-wide agreement metric is generated.
 
+For the final ordinal-BCE ResNet-50 and DenseNet-121 models, `target_class` is decoded by counting threshold probabilities above 0.5. Class-dependent XAI and Quantus evaluate the differentiable score of that original predicted KL class, recorded as `xai_target: predicted_kl_class_score`; image masking never changes the target class being evaluated.
+
 Research comparisons by disease severity use `true_kl`. Comparisons of correct and incorrect predictions use `is_correct`.
 
 `demo_xai_metrics.csv` is synthetic data included only to demonstrate the Research Mode interface. It is not an experiment result and must not be used in analysis or reported conclusions.

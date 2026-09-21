@@ -2,7 +2,7 @@
 
 An educational and research project for classifying knee osteoarthritis from X-ray images and visualizing model predictions.
 
-The model predicts the Kellgren-Lawrence grade (KL Grade 0-4). The project includes ResNet-50 architectures, ONNX Runtime inference, a FastAPI service, and a Streamlit interface.
+The final ResNet-50 and DenseNet-121 models predict the Kellgren-Lawrence grade (KL Grade 0-4) using ordinal BCE with four threshold outputs. The project includes ONNX Runtime inference, a FastAPI service, and a Streamlit interface.
 
 The project implements Grad-CAM, Grad-CAM++, Eigen-CAM, Integrated Gradients, and SmoothGrad to interpret predictions. The interface also supports comparing explanations across methods and evaluating their stability.
 
@@ -59,13 +59,23 @@ Place images listed in `inputs/manifest.json` locally, ensure the corresponding 
 
 The runner writes a validated partial CSV to `results/research/` after each completed image/method pair. Use `--device auto` to select CUDA when available, or `--device cuda` to require it; continue a matching interrupted run with `--resume`. CUDA setup is documented separately in [`requirements-gpu.md`](requirements-gpu.md). The small one-image / one-perturbation command is a pipeline check only; it is not sufficient for scientific conclusions.
 
-To add DenseNet-121, place its checkpoint at `models/densenet121_finetune_block3_4_best.pth` and export the matching ONNX file:
+The final ordinal checkpoints expected by the application are:
+
+```text
+models/resnet50_ordinal_finetune_layer3_4_best_21092026.pth
+models/densenet121_ordinal_finetune_block3_4_best_21092026.pth
+```
+
+They produce four threshold logits. The KL prediction uses the validation-time rule `sum(sigmoid(logits) > 0.5)`. Class-dependent XAI methods and Quantus use a differentiable five-class ordinal score derived from those thresholds; Eigen-CAM remains class-independent.
+
+Export the matching ONNX files with:
 
 ```powershell
+.\.venv\Scripts\python.exe scripts\export_to_onnx.py --architecture resnet50
 .\.venv\Scripts\python.exe scripts\export_to_onnx.py --architecture densenet121
 ```
 
-The expected ONNX output path is `models/densenet121_kl.onnx`; DenseNet-121 will then appear in the application model selector.
+The expected output paths are `models/resnet50_ordinal_kl.onnx` and `models/densenet121_ordinal_kl.onnx`.
 Only export checkpoints you trust: older PyTorch checkpoints can contain training metadata and require trusted deserialisation during export.
 
 ## Notes on XAI evaluation

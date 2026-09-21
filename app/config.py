@@ -5,10 +5,10 @@ MODEL_DIR = BASE_DIR / "models"
 
 ONNX_MODEL_PATH = MODEL_DIR / "vit_kl.onnx"
 PYTORCH_CHECKPOINT_PATH = MODEL_DIR / "vit_phase2_best.pth"
-RESNET_ONNX_MODEL_PATH = MODEL_DIR / "resnet50_kl.onnx"
-RESNET_PYTORCH_CHECKPOINT_PATH = MODEL_DIR / "resnet50_phase2_best.pth"
-DENSENET_ONNX_MODEL_PATH = MODEL_DIR / "densenet121_kl.onnx"
-DENSENET_PYTORCH_CHECKPOINT_PATH = MODEL_DIR / "densenet121_finetune_block3_4_best.pth"
+RESNET_ONNX_MODEL_PATH = MODEL_DIR / "resnet50_ordinal_kl.onnx"
+RESNET_PYTORCH_CHECKPOINT_PATH = MODEL_DIR / "resnet50_ordinal_finetune_layer3_4_best_21092026.pth"
+DENSENET_ONNX_MODEL_PATH = MODEL_DIR / "densenet121_ordinal_kl.onnx"
+DENSENET_PYTORCH_CHECKPOINT_PATH = MODEL_DIR / "densenet121_ordinal_finetune_block3_4_best_21092026.pth"
 
 MODEL_CONFIGS = {
     "vit": {
@@ -17,14 +17,18 @@ MODEL_CONFIGS = {
         "checkpoint_path": PYTORCH_CHECKPOINT_PATH,
     },
     "resnet50": {
-        "display_name": "ResNet-50",
+        "display_name": "ResNet-50 (ordinal BCE)",
         "onnx_path": RESNET_ONNX_MODEL_PATH,
         "checkpoint_path": RESNET_PYTORCH_CHECKPOINT_PATH,
+        "output_type": "ordinal_thresholds",
+        "num_outputs": 4,
     },
     "densenet121": {
-        "display_name": "DenseNet-121",
+        "display_name": "DenseNet-121 (ordinal BCE)",
         "onnx_path": DENSENET_ONNX_MODEL_PATH,
         "checkpoint_path": DENSENET_PYTORCH_CHECKPOINT_PATH,
+        "output_type": "ordinal_thresholds",
+        "num_outputs": 4,
     },
 }
 

@@ -11,6 +11,7 @@ MPL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(MPL_CACHE_DIR))
 
 from app.xai import generate_xai_attributions
+from app.config import MODEL_CONFIGS
 from app.metric_registry import METRIC_REGISTRY
 
 
@@ -78,6 +79,8 @@ def evaluate_quantus_metrics(
     feature_count = int(attribution.shape[0] * attribution.shape[1])
     subset_size = max(1, min(224, feature_count - 1))
     device = str(_model_device(model))
+    is_ordinal = MODEL_CONFIGS.get(model_name, {}).get("output_type") == "ordinal_thresholds"
+    model_output = "ordinal_class_log_score" if is_ordinal else "logit"
 
     def explain_func(model, inputs, targets, **_):
         return generate_xai_attributions(
@@ -134,7 +137,8 @@ def evaluate_quantus_metrics(
             "nr_runs": faithfulness_runs,
             "subset_size": subset_size,
             "perturb_baseline": "mean",
-            "model_output": "logit",
+            "model_output": model_output,
+            "xai_target": "predicted_kl_class_score" if is_ordinal else "predicted_class_logit",
         },
         "MaxSensitivity": {
             "attribution": "raw_scale_preserving",
@@ -142,7 +146,8 @@ def evaluate_quantus_metrics(
             "perturbation": "gaussian_noise",
             "lower_bound": 0.05,
             "upper_bound": None,
-            "model_output": "logit",
+            "model_output": model_output,
+            "xai_target": "predicted_kl_class_score" if is_ordinal else "predicted_class_logit",
         },
         "Sparseness": {"attribution": "raw_scale_preserving"},
     }

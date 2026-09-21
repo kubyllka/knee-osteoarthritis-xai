@@ -48,6 +48,11 @@ def create_resnet50_model(num_classes=5, freeze_backbone=True):
     return model
 
 
+def create_resnet50_ordinal_model(num_classes=5, freeze_backbone=True):
+    """ResNet-50 architecture used by the final ordinal-BCE checkpoint."""
+    return create_resnet50_model(num_classes=num_classes - 1, freeze_backbone=freeze_backbone)
+
+
 def create_densenet121_model(num_classes=5, freeze_backbone=True):
     """Create a standard DenseNet-121 with a KL-grade classification head."""
     model = models.densenet121(weights=None)
@@ -65,6 +70,23 @@ def create_densenet121_model(num_classes=5, freeze_backbone=True):
         nn.ReLU(),
         nn.Dropout(0.3),
         nn.Linear(512, num_classes),
+    )
+    return model
+
+
+def create_densenet121_ordinal_model(num_classes=5, freeze_backbone=True):
+    """DenseNet-121 architecture used by the final ordinal-BCE checkpoint."""
+    model = models.densenet121(weights=None)
+    if freeze_backbone:
+        for param in model.parameters():
+            param.requires_grad = False
+    num_features = model.classifier.in_features
+    model.classifier = nn.Sequential(
+        nn.Dropout(0.5),
+        nn.Linear(num_features, 512),
+        nn.ReLU(),
+        nn.Dropout(0.3),
+        nn.Linear(512, num_classes - 1),
     )
     return model
 

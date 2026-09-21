@@ -23,7 +23,7 @@ from app.inference import ONNXKneeOsteoarthritisClassifier
 from app.metric_registry import is_legacy_metric, metric_definition, parse_parameters
 from app.quantus_metrics import evaluate_quantus_metrics
 from app.research.results import ResearchResultsValidationError, load_research_results, validate_research_results
-from app.xai import generate_xai_visualization, load_xai_model_by_name, preprocess_pil_for_torch
+from app.xai import generate_xai_visualization, load_xai_model_by_name, predict_kl_with_xai_model, preprocess_pil_for_torch
 
 
 GRADE_MEANINGS = {
@@ -48,7 +48,8 @@ QUICK_MAX_SENSITIVITY_SAMPLES = 2
 
 @st.cache_resource
 def get_local_classifier(model_name: str) -> ONNXKneeOsteoarthritisClassifier:
-    return ONNXKneeOsteoarthritisClassifier(MODEL_CONFIGS[model_name]["onnx_path"])
+    config = MODEL_CONFIGS[model_name]
+    return ONNXKneeOsteoarthritisClassifier(config["onnx_path"], output_type=config.get("output_type", "multiclass"))
 
 
 @st.cache_resource
@@ -434,7 +435,7 @@ def show_xai(
     model = get_xai_model(model_name)
     _, parity_tensor = preprocess_pil_for_torch(image)
     with torch.no_grad():
-        xai_grade = int(model(parity_tensor).argmax(dim=1).item())
+        xai_grade = predict_kl_with_xai_model(model, parity_tensor, model_name)
     if xai_grade != int(prediction["grade"]):
         st.error(
             f"XAI stopped: ONNX prediction is KL{prediction['grade']}, but the PyTorch XAI checkpoint predicts KL{xai_grade}."

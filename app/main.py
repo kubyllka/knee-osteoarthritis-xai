@@ -14,7 +14,9 @@ classifiers: dict[str, ONNXKneeOsteoarthritisClassifier] = {}
 async def lifespan(app: FastAPI):
     global classifiers
     classifiers = {
-        model_name: ONNXKneeOsteoarthritisClassifier(config["onnx_path"])
+        model_name: ONNXKneeOsteoarthritisClassifier(
+            config["onnx_path"], output_type=config.get("output_type", "multiclass")
+        )
         for model_name, config in MODEL_CONFIGS.items()
         if config["onnx_path"].exists()
     }

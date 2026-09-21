@@ -16,12 +16,13 @@ from app.config import (
     PYTORCH_CHECKPOINT_PATH,
 )
 from app.model_definition import (
-    create_densenet121_model,
-    create_resnet50_model,
+    create_densenet121_ordinal_model,
+    create_resnet50_ordinal_model,
     create_vit_model,
     identity_reshape_transform,
     vit_reshape_transform,
 )
+from app.ordinal import OrdinalClassScoreModel, ordinal_logits_to_class
 
 
 @dataclass
@@ -64,15 +65,16 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path) -> torch.nn.M
 
 def create_xai_model(model_name: str) -> torch.nn.Module:
     if model_name == "resnet50":
-        return create_resnet50_model(num_classes=NUM_CLASSES, freeze_backbone=False)
+        return create_resnet50_ordinal_model(num_classes=NUM_CLASSES, freeze_backbone=False)
     if model_name == "densenet121":
-        return create_densenet121_model(num_classes=NUM_CLASSES, freeze_backbone=False)
+        return create_densenet121_ordinal_model(num_classes=NUM_CLASSES, freeze_backbone=False)
     if model_name == "vit":
         return create_vit_model(num_classes=NUM_CLASSES, freeze_backbone=False)
     raise ValueError(f"Unsupported model name: {model_name}")
 
 
 def get_target_layer_and_transform(model: torch.nn.Module, model_name: str):
+    model = model.base_model if isinstance(model, OrdinalClassScoreModel) else model
     if model_name == "resnet50":
         return model.layer4[-1], identity_reshape_transform
     if model_name == "densenet121":
@@ -93,9 +95,19 @@ def load_xai_model(
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"PyTorch checkpoint not found: {checkpoint_path}")
 
-    model = create_xai_model(model_name)
-    model = load_checkpoint(model, checkpoint_path)
+    model = load_checkpoint(create_xai_model(model_name), checkpoint_path)
+    if MODEL_CONFIGS[model_name].get("output_type") == "ordinal_thresholds":
+        model = OrdinalClassScoreModel(model)
     return model.to(device).eval()
+
+
+def predict_kl_with_xai_model(model: torch.nn.Module, input_tensor: torch.Tensor, model_name: str) -> int:
+    """Decode base ordinal logits with the same threshold rule used in training."""
+    base_model = model.base_model if isinstance(model, OrdinalClassScoreModel) else model
+    logits = base_model(input_tensor)
+    if MODEL_CONFIGS[model_name].get("output_type") == "ordinal_thresholds":
+        return int(ordinal_logits_to_class(logits).item())
+    return int(logits.argmax(dim=1).item())
 
 
 def load_xai_model_by_name(
