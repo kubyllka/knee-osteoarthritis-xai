@@ -22,6 +22,8 @@ class QuantusScore:
     score_direction: str
     value: float
     parameters: dict
+    status: str = "ok"
+    note: str | None = None
 
 
 QUANTUS_METRIC_METADATA = METRIC_REGISTRY
@@ -91,8 +93,10 @@ def evaluate_quantus_metrics(
             model_name=model_name,
         )
 
-    metric_scores = {
-        "FaithfulnessCorrelation": quantus.FaithfulnessCorrelation(
+    metric_scores: dict[str, object] = {}
+    metric_statuses: dict[str, str] = {}
+    metric_notes: dict[str, str] = {}
+    metric_scores["FaithfulnessCorrelation"] = quantus.FaithfulnessCorrelation(
             nr_runs=faithfulness_runs,
             subset_size=subset_size,
             abs=False,
@@ -106,8 +110,9 @@ def evaluate_quantus_metrics(
             a_batch=a_batch,
             channel_first=True,
             device=device,
-        ),
-        "MaxSensitivity": quantus.MaxSensitivity(
+        )
+    try:
+        metric_scores["MaxSensitivity"] = quantus.MaxSensitivity(
             nr_samples=max_sensitivity_samples,
             lower_bound=0.05,
             disable_warnings=True,
@@ -119,16 +124,29 @@ def evaluate_quantus_metrics(
             channel_first=True,
             explain_func=explain_func,
             device=device,
-        ),
-        "Sparseness": quantus.Sparseness(disable_warnings=True)(
+        )
+    except AssertionError as exc:
+        if "attribution vector are all equal to zero" not in str(exc):
+            raise
+        # A zero map after a MaxSensitivity perturbation is a legitimate
+        # degenerate explanation, but Quantus deliberately refuses to score it.
+        # Record it transparently rather than injecting an epsilon or losing the
+        # entire sample × method result.
+        metric_scores["MaxSensitivity"] = [float("nan")]
+        metric_statuses["MaxSensitivity"] = "undefined_zero_perturbed_attribution"
+        metric_notes["MaxSensitivity"] = (
+            "Quantus could not evaluate MaxSensitivity because at least one "
+            "perturbed input produced an all-zero attribution map."
+        )
+
+    metric_scores["Sparseness"] = quantus.Sparseness(disable_warnings=True)(
             model=model,
             x_batch=x_batch,
             y_batch=y_batch,
             a_batch=a_batch,
             channel_first=True,
             device=device,
-        ),
-    }
+        )
 
     parameters = {
         "FaithfulnessCorrelation": {
@@ -157,8 +175,10 @@ def evaluate_quantus_metrics(
             metric_name=name,
             metric_category=QUANTUS_METRIC_METADATA[name].category,
             score_direction=QUANTUS_METRIC_METADATA[name].score_direction,
-            value=_first_score(score),
+            value=(float("nan") if name in metric_statuses else _first_score(score)),
             parameters=parameters[name],
+            status=metric_statuses.get(name, "ok"),
+            note=metric_notes.get(name),
         )
         for name, score in metric_scores.items()
     ]

@@ -6,7 +6,7 @@ The final ResNet-50 and DenseNet-121 models predict the Kellgren-Lawrence grade 
 
 The project implements Grad-CAM, Grad-CAM++, Eigen-CAM, Integrated Gradients, and SmoothGrad to interpret predictions. The interface also supports comparing explanations across methods and evaluating their stability.
 
-Research Mode reads precomputed experiment CSV files and presents one XAI metric at a time, so metrics with different numerical scales are never averaged together. Prediction Mode can optionally run a small on-demand Quantus comparison for the selected XAI methods; use the offline runner for reproducible dataset-level experiments.
+Research Mode reads one or more precomputed experiment CSV files. Its Results analysis view reports classifier-subset performance and metric-specific KL-stage statistics; its exploration view presents one XAI metric at a time, so metrics with different numerical scales are never averaged together. Prediction Mode can optionally run a small on-demand Quantus comparison for the selected XAI methods; use the offline runner for reproducible dataset-level experiments.
 
 ## Features
 
@@ -20,7 +20,7 @@ Research Mode reads precomputed experiment CSV files and presents one XAI metric
 
 **Prediction Mode** is intended for analysing one uploaded X-ray. It generates a model prediction and selected XAI maps. Quantus evaluation is optional and uses a small exploratory profile so it does not run automatically on every upload.
 
-**Research Mode** is intended for already computed results. It is organised by evaluation dimension: Faithfulness, Robustness, Complexity, and future Custom checks. Within a dimension, select one metric to view its definition, configuration, XAI quality by true KL grade, and correct-versus-incorrect prediction comparison. A CSV row represents one `sample x XAI method x metric` value; details of the results format are in [`results/research/README.md`](results/research/README.md).
+**Research Mode** is intended for already computed results. Select compatible CSV files to combine models without manual merging. Results analysis derives classifier-subset statistics and performs metric-specific KL0–KL4 Kruskal–Wallis, Holm, epsilon-squared, and conditional Dunn post-hoc analysis. The exploration view remains organised by Faithfulness, Robustness, Complexity, and Custom checks. A CSV row represents one `sample x XAI method x metric` value; details of the results format are in [`results/research/README.md`](results/research/README.md).
 
 ## Project structure
 

@@ -13,3 +13,6 @@ requests==2.32.3
 streamlit==1.41.1
 pandas==2.2.3
 quantus==0.6.0
+scipy==1.18.1
+scikit-learn==1.9.0
+scikit-posthocs==0.17.0

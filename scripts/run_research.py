@@ -23,6 +23,8 @@ from app.xai import generate_xai_visualization, load_xai_model_by_name, predict_
 
 
 DEFAULT_METHODS = ["Grad-CAM", "SmoothGrad"]
+ORDINAL_LOGIT_PARITY_ATOL = 1e-2
+ORDINAL_THRESHOLD_MARGIN = 1e-3
 RUNNER_METRICS = frozenset(
     {
         "FaithfulnessCorrelation",
@@ -32,6 +34,51 @@ RUNNER_METRICS = frozenset(
         "Stability score",
     }
 )
+
+
+def ordinal_parity_warning(
+    onnx_logits: np.ndarray,
+    pytorch_logits: np.ndarray,
+    onnx_grade: int,
+    pytorch_grade: int,
+) -> str | None:
+    """Accept only numerically borderline ordinal grade differences.
+
+    ONNX Runtime and PyTorch can differ in the last few decimal places. For an
+    ordinal threshold logit extremely close to zero, that may flip one binary
+    threshold while still representing the same checkpoint. A material logit
+    difference remains a hard error, preventing accidental checkpoint/ONNX
+    mismatches from entering a research run.
+    """
+    onnx_values = np.asarray(onnx_logits, dtype=float).reshape(-1)
+    pytorch_values = np.asarray(pytorch_logits, dtype=float).reshape(-1)
+    if onnx_values.shape != pytorch_values.shape:
+        raise RuntimeError(
+            "ONNX/PyTorch ordinal output shapes differ: "
+            f"{onnx_values.shape} versus {pytorch_values.shape}."
+        )
+    max_difference = float(np.max(np.abs(onnx_values - pytorch_values)))
+    if max_difference > ORDINAL_LOGIT_PARITY_ATOL:
+        raise RuntimeError(
+            "ONNX/PyTorch ordinal logits differ materially "
+            f"(max absolute difference {max_difference:.6f} > {ORDINAL_LOGIT_PARITY_ATOL}). "
+            "Export ONNX again from the selected checkpoint and verify the model files."
+        )
+    if onnx_grade == pytorch_grade:
+        return None
+
+    different_thresholds = (onnx_values > 0.0) != (pytorch_values > 0.0)
+    threshold_distance = np.maximum(np.abs(onnx_values), np.abs(pytorch_values))
+    if not different_thresholds.any() or np.any(threshold_distance[different_thresholds] > ORDINAL_THRESHOLD_MARGIN):
+        raise RuntimeError(
+            f"Prediction mismatch: ONNX predicted KL{onnx_grade}, but the PyTorch XAI checkpoint "
+            f"predicted KL{pytorch_grade}. The disagreement is not within the "
+            f"{ORDINAL_THRESHOLD_MARGIN} ordinal-threshold margin."
+        )
+    return (
+        f"near-threshold ordinal parity: ONNX KL{onnx_grade}, PyTorch KL{pytorch_grade}, "
+        f"max logit difference {max_difference:.6f}. XAI targets the ONNX predicted class."
+    )
 
 
 def resolve_device(requested_device: str) -> torch.device:
@@ -92,6 +139,8 @@ def metric_row(
     metric_source: str,
     score_direction: str,
     metric_parameters: dict,
+    metric_status: str = "ok",
+    metric_note: str | None = None,
 ) -> dict:
     predicted_kl = int(prediction["grade"])
     return {
@@ -115,6 +164,8 @@ def metric_row(
         "metric_source": metric_source,
         "score_direction": score_direction,
         "metric_parameters": serialise_parameters(metric_parameters),
+        "metric_status": metric_status,
+        "metric_note": metric_note,
     }
 
 
@@ -214,6 +265,8 @@ def quantus_metric_rows(
             "quantus",
             score.score_direction,
             {**score.parameters, "device": device_name},
+            score.status,
+            score.note,
         )
         for score in scores
     ]
@@ -345,7 +398,23 @@ def run_research(
         input_tensor = input_tensor.to(selected_device)
         with torch.no_grad():
             xai_prediction = predict_kl_with_xai_model(xai_model, input_tensor, model_name)
-        if xai_prediction != int(prediction["grade"]):
+        if model_config.get("output_type") == "ordinal_thresholds":
+            base_model = xai_model.base_model
+            with torch.no_grad():
+                pytorch_logits = base_model(input_tensor).detach().cpu().numpy()
+            onnx_logits = classifier.session.run(
+                None,
+                {classifier.input_name: input_tensor.detach().cpu().numpy()},
+            )[0]
+            warning = ordinal_parity_warning(
+                onnx_logits,
+                pytorch_logits,
+                int(prediction["grade"]),
+                xai_prediction,
+            )
+            if warning:
+                print(f"  Warning for {sample.sample_id}: {warning}")
+        elif xai_prediction != int(prediction["grade"]):
             raise RuntimeError(
                 f"Prediction mismatch for {sample.sample_id}: ONNX predicted KL{prediction['grade']}, "
                 f"but the PyTorch XAI checkpoint predicted KL{xai_prediction}."

@@ -22,6 +22,13 @@ from app.evaluation import (
 from app.inference import ONNXKneeOsteoarthritisClassifier
 from app.metric_registry import is_legacy_metric, metric_definition, parse_parameters
 from app.quantus_metrics import evaluate_quantus_metrics
+from app.research.analysis import (
+    ResearchAnalysisError,
+    classifier_subset_summary,
+    dunn_posthoc,
+    kl_stage_analysis,
+    merge_research_results,
+)
 from app.research.results import ResearchResultsValidationError, load_research_results, validate_research_results
 from app.xai import generate_xai_visualization, load_xai_model_by_name, predict_kl_with_xai_model, preprocess_pil_for_torch
 
@@ -44,6 +51,17 @@ DEFAULT_XAI_METHODS = ["Grad-CAM", "Grad-CAM++", "Eigen-CAM"]
 RESEARCH_RESULTS_DIR = Path("results/research")
 QUICK_FAITHFULNESS_RUNS = 8
 QUICK_MAX_SENSITIVITY_SAMPLES = 2
+
+# These orders make the two-model Results overview directly comparable. They
+# deliberately do not imply that one metric or method is an overall winner.
+PRIMARY_KL_METRIC_ORDER = [
+    "FaithfulnessCorrelation",
+    "Deletion confidence drop",
+    "MaxSensitivity",
+    "Stability score",
+    "Sparseness",
+]
+KL_GRADE_LABELS = [f"KL{grade}" for grade in range(5)]
 
 
 @st.cache_resource
@@ -155,6 +173,12 @@ def _metric_category(metric_name: str, csv_category: str) -> str:
     """Use current definitions for known metrics, including older CSVs."""
     definition = metric_definition(metric_name)
     return definition.category if definition else csv_category
+
+
+def _is_custom_check(metric_name: str, csv_source: str | None) -> bool:
+    """Keep project-specific checks visible even when their scientific dimension differs."""
+    definition = metric_definition(metric_name)
+    return definition.source == "custom" if definition else csv_source == "custom"
 
 
 def _selected_metric_rows(frame: pd.DataFrame, metric_name: str) -> pd.DataFrame:
@@ -281,16 +305,33 @@ def _summary_cards(filtered: pd.DataFrame, definition) -> None:
 
 
 def _show_metric_dashboard(filtered: pd.DataFrame, selected_metric: str) -> None:
+    all_rows = filtered.copy()
+    status = all_rows.get("metric_status", pd.Series("ok", index=all_rows.index))
+    undefined_rows = all_rows[status.ne("ok")]
+    filtered = all_rows[status.eq("ok")].copy()
+
     definition = metric_definition(selected_metric)
     if definition is None:
         st.warning("This legacy metric has no registered display metadata. Its raw rows are shown below.")
         with st.expander("Filtered research rows"):
-            st.dataframe(filtered, use_container_width=True, hide_index=True)
+            st.dataframe(all_rows, use_container_width=True, hide_index=True)
         return
 
     display_format = definition.display_format
     st.subheader(selected_metric)
     st.caption(f"**{definition.score_direction.title()} is better.** {definition.description} {definition.interpretation}")
+    if not undefined_rows.empty:
+        st.warning(
+            f"{len(undefined_rows)} metric row(s) from {undefined_rows['sample_id'].nunique()} image(s) "
+            "were not evaluated because a perturbed input produced an all-zero attribution map. "
+            "They are excluded from summaries and charts; inspect them in the detailed rows below."
+        )
+    if filtered.empty:
+        st.info("No valid numeric values remain for this metric under the active filters.")
+        with st.expander("Filtered research rows"):
+            st.dataframe(all_rows, use_container_width=True, hide_index=True)
+        return
+
     _summary_cards(filtered, definition)
     if definition.category == "complexity":
         st.info("Sparseness is descriptive: 'most concentrated' does not mean clinically best explanation.")
@@ -341,7 +382,257 @@ def _show_metric_dashboard(filtered: pd.DataFrame, selected_metric: str) -> None
     summary = group_summary.rename(columns={"true_kl": "True KL grade"})
     st.dataframe(_format_summary(summary, display_format), use_container_width=True, hide_index=True)
     with st.expander("Filtered research rows"):
-        st.dataframe(filtered, use_container_width=True, hide_index=True)
+        st.dataframe(all_rows, use_container_width=True, hide_index=True)
+
+
+def _format_results_analysis_table(table: pd.DataFrame):
+    formats = {
+        "Accuracy": "{:.1%}",
+        "Balanced accuracy": "{:.1%}",
+        "Macro F1": "{:.3f}",
+        "Quadratic weighted kappa": "{:.3f}",
+        "p raw": "{:.3g}",
+        "p Holm": "{:.3g}",
+        "Kruskal–Wallis H": "{:.3f}",
+        "epsilon squared": "{:.3f}",
+        "p Dunn-Holm": "{:.3g}",
+    }
+    for column in table.columns:
+        if any(column.endswith(suffix) for suffix in ("median", "Q1", "Q3", "IQR")):
+            formats[column] = "{:.4g}"
+    return table.style.format(formats, na_rep="—")
+
+
+def _classifier_accuracy_chart_data(classifier_by_grade: pd.DataFrame) -> pd.DataFrame:
+    """Prepare one labelled accuracy bar for each model and true KL grade."""
+    data = classifier_by_grade.copy()
+    data["True KL grade"] = pd.Categorical(
+        data["True KL grade"], categories=KL_GRADE_LABELS, ordered=True
+    )
+    data["Accuracy label"] = data["Accuracy"].map(lambda value: f"{value:.1%}")
+    data["Correct / images"] = data.apply(
+        lambda row: f"{int(row['Correct'])} / {int(row['Images'])}", axis=1
+    )
+    return data.sort_values(["True KL grade", "Model"]).reset_index(drop=True)
+
+
+def _classifier_accuracy_chart(classifier_by_grade: pd.DataFrame):
+    data = _classifier_accuracy_chart_data(classifier_by_grade)
+    model_order = sorted(data["Model"].unique())
+    color_scale = alt.Scale(
+        domain=model_order,
+        range=["#2563eb", "#e76f51", "#7c3aed", "#0f766e"][: len(model_order)],
+    )
+    base = alt.Chart(data).encode(
+        x=alt.X("True KL grade:N", title="True KL grade", sort=KL_GRADE_LABELS),
+        xOffset=alt.XOffset("Model:N", sort=model_order),
+        color=alt.Color("Model:N", title="Model", sort=model_order, scale=color_scale),
+    )
+    bars = base.mark_bar().encode(
+        y=alt.Y(
+            "Accuracy:Q",
+            title="Classification accuracy",
+            scale=alt.Scale(domain=[0, 1]),
+            axis=alt.Axis(format="%"),
+        ),
+        tooltip=[
+            alt.Tooltip("Model:N"),
+            alt.Tooltip("True KL grade:N"),
+            alt.Tooltip("Correct:Q"),
+            alt.Tooltip("Images:Q", title="Images in XAI subset"),
+            alt.Tooltip("Accuracy:Q", format=".1%"),
+        ],
+    )
+    labels = base.mark_text(dy=-9, color="#1f2937", fontSize=11).encode(
+        y=alt.Y("Accuracy:Q"),
+        text="Accuracy label:N",
+    )
+    return (bars + labels).properties(height=330)
+
+
+def _effect_map_data(analysis: pd.DataFrame, model_name: str) -> pd.DataFrame:
+    """Return a complete metric-by-method grid for one model's KL-stage effects."""
+    selected = analysis[analysis["Model"].eq(model_name)].copy()
+    keys = ["Metric", "XAI method"]
+    if selected.duplicated(keys).any():
+        raise ValueError(f"Effect map has duplicate model/metric/method rows for {model_name}.")
+    grid = pd.MultiIndex.from_product(
+        [PRIMARY_KL_METRIC_ORDER, XAI_METHODS], names=keys
+    ).to_frame(index=False)
+    columns = [
+        "Metric",
+        "XAI method",
+        "epsilon squared",
+        "Kruskal–Wallis H",
+        "p raw",
+        "p Holm",
+        "Valid N",
+        "Excluded undefined",
+        "Global significant",
+    ]
+    data = grid.merge(selected[[column for column in columns if column in selected.columns]], on=keys, how="left")
+    data["Effect label"] = data.apply(
+        lambda row: (
+            "—"
+            if pd.isna(row["epsilon squared"])
+            else f"{float(row['epsilon squared']):.3f}{'*' if bool(row.get('Global significant', False)) else ''}"
+        ),
+        axis=1,
+    )
+    data["Significance"] = data["Global significant"].map(
+        {True: "Holm-significant", False: "Not Holm-significant"}
+    ).fillna("No result")
+    data["Metric"] = pd.Categorical(data["Metric"], categories=PRIMARY_KL_METRIC_ORDER, ordered=True)
+    data["XAI method"] = pd.Categorical(data["XAI method"], categories=XAI_METHODS, ordered=True)
+    return data.sort_values(["Metric", "XAI method"]).reset_index(drop=True)
+
+
+def _effect_map_scale_max(analysis: pd.DataFrame) -> float:
+    values = pd.to_numeric(analysis.get("epsilon squared"), errors="coerce").dropna()
+    return max(float(values.max()), 0.01) if not values.empty else 1.0
+
+
+def _effect_map_chart(effect_data: pd.DataFrame, model_name: str, scale_max: float):
+    color = alt.condition(
+        "isValid(datum['epsilon squared'])",
+        alt.Color(
+            "epsilon squared:Q",
+            title="KL-stage effect (ε²)",
+            scale=alt.Scale(domain=[0, scale_max], scheme="blues"),
+        ),
+        alt.value("#edf0f4"),
+    )
+    base = alt.Chart(effect_data).encode(
+        x=alt.X("XAI method:N", title=None, sort=XAI_METHODS, axis=alt.Axis(labelAngle=-35)),
+        y=alt.Y("Metric:N", title=None, sort=PRIMARY_KL_METRIC_ORDER),
+    )
+    cells = base.mark_rect(cornerRadius=3).encode(
+        color=color,
+        tooltip=[
+            alt.Tooltip("Metric:N"),
+            alt.Tooltip("XAI method:N"),
+            alt.Tooltip("epsilon squared:Q", title="ε²", format=".3f"),
+            alt.Tooltip("Kruskal–Wallis H:Q", title="Kruskal–Wallis H", format=".3f"),
+            alt.Tooltip("p raw:Q", format=".3g"),
+            alt.Tooltip("p Holm:Q", format=".3g"),
+            alt.Tooltip("Valid N:Q"),
+            alt.Tooltip("Excluded undefined:Q"),
+            alt.Tooltip("Significance:N"),
+        ],
+    )
+    labels = base.mark_text(fontSize=11).encode(
+        text="Effect label:N",
+        color=alt.condition(
+            "datum['epsilon squared'] >= 0.35", alt.value("white"), alt.value("#1f2937")
+        ),
+    )
+    return (cells + labels).properties(title=model_name, height=260)
+
+
+def _show_results_analysis(results: pd.DataFrame) -> None:
+    st.subheader("Research overview")
+    st.caption(
+        "This overview uses every image in the loaded XAI result files. Top filters apply only to "
+        "Explore metrics, so they cannot distort classifier-subset accuracy or primary KL-stage analysis."
+    )
+
+    try:
+        classifier_summary, classifier_by_grade, confusion_matrices = classifier_subset_summary(results)
+        analysis = kl_stage_analysis(results)
+    except ResearchAnalysisError as exc:
+        st.error(f"Results analysis cannot be calculated: {exc}")
+        return
+
+    st.markdown("#### Classification accuracy by true KL grade")
+    st.caption(
+        "Each bar shows correct predictions divided by all images of that true KL grade. "
+        "These are results for the loaded XAI subset, not the full held-out classifier test set."
+    )
+    st.altair_chart(_classifier_accuracy_chart(classifier_by_grade), use_container_width=True)
+
+    st.markdown("#### KL-stage effect map")
+    st.caption(
+        "Each cell is the Kruskal–Wallis epsilon-squared effect size (ε²) for one XAI method and metric. "
+        "A * marks a Holm-significant global KL-stage test. Both models use the same colour scale."
+    )
+    model_names = sorted(analysis["Model"].unique())
+    effect_scale_max = _effect_map_scale_max(analysis)
+    map_columns = st.columns(min(len(model_names), 2)) if model_names else []
+    for index, model_name in enumerate(model_names):
+        # Streamlit columns are reused gracefully if an uploaded set has more than two models.
+        with map_columns[index % len(map_columns)]:
+            st.altair_chart(
+                _effect_map_chart(_effect_map_data(analysis, model_name), model_name, effect_scale_max),
+                use_container_width=True,
+            )
+    st.caption(
+        "ε² describes the strength of association between true KL stage and this specific metric; it is not an "
+        "XAI-method quality score or leaderboard. A result that is significant for one architecture and not the other "
+        "does not by itself establish an architecture difference. Sparseness describes concentration, while deletion is "
+        "a supporting faithfulness check influenced partly by the original model confidence."
+    )
+
+    grade_n_columns = [f"KL{grade} n" for grade in range(5)]
+    tests_per_model = analysis.groupby("Model").size()
+    complete_primary_family = tests_per_model.eq(25).all() and analysis["KL groups"].eq(5).all()
+    if not complete_primary_family:
+        st.warning(
+            "Incomplete primary test family: thesis-level inference expects five metrics, five XAI methods, "
+            "and all five KL groups for each selected model. Displayed statistics are exploratory."
+        )
+    if (analysis[grade_n_columns] < 10).any().any():
+        st.warning("Small-sample warning: at least one KL group has fewer than 10 valid values.")
+    excluded = int(analysis["Excluded undefined"].sum())
+    if excluded:
+        st.warning(
+            f"{excluded} undefined metric row(s) were excluded without imputation; their valid companion metrics remain included."
+        )
+
+    with st.expander("Classifier subset details"):
+        st.caption("These metrics describe only images included in the loaded XAI CSV files, not the full held-out classifier test set.")
+        st.dataframe(_format_results_analysis_table(classifier_summary), use_container_width=True, hide_index=True)
+        st.dataframe(_format_results_analysis_table(classifier_by_grade), use_container_width=True, hide_index=True)
+        for model_name, matrix in confusion_matrices.items():
+            st.markdown(f"**{model_name}: confusion matrix**")
+            st.dataframe(matrix, use_container_width=True)
+
+    with st.expander("KL-stage statistical table"):
+        st.caption(
+            "Kruskal–Wallis tests compare true KL groups within one model × XAI method × metric. "
+            "Holm correction is applied separately within each model. "
+            "ε² = max(0, (H − k + 1) / (N − k))."
+        )
+        st.dataframe(_format_results_analysis_table(analysis), use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download KL-stage summary CSV",
+            data=analysis.to_csv(index=False).encode("utf-8"),
+            file_name="kl_stage_analysis.csv",
+            mime="text/csv",
+        )
+
+    with st.expander("Dunn post-hoc KL comparisons"):
+        if not complete_primary_family:
+            st.info(
+                "Dunn post-hoc comparisons require the complete primary KL analysis: five metrics, "
+                "five XAI methods, and all five KL groups for every selected model."
+            )
+            return
+        try:
+            posthoc = dunn_posthoc(results, analysis)
+        except ResearchAnalysisError as exc:
+            st.error(f"Post-hoc comparisons are unavailable: {exc}")
+            return
+        if posthoc.empty:
+            st.info("No Holm-significant global KL tests were available for post-hoc comparison.")
+        else:
+            st.caption("Dunn pairwise tests are calculated only after a Holm-significant global test; each set of ten KL pairs uses Holm correction.")
+            st.dataframe(_format_results_analysis_table(posthoc), use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download Dunn post-hoc CSV",
+                data=posthoc.to_csv(index=False).encode("utf-8"),
+                file_name="dunn_posthoc_kl_pairs.csv",
+                mime="text/csv",
+            )
 
 
 def show_research_mode() -> None:
@@ -351,25 +642,40 @@ def show_research_mode() -> None:
     )
 
     available_files = sorted(RESEARCH_RESULTS_DIR.glob("*.csv"))
-    source_options = [f"Repository file: {path.name}" for path in available_files]
-    source_options.append("Upload CSV for this session")
-    selected_source = st.selectbox("Research results source", source_options)
+    source_mode = st.radio(
+        "Research results source",
+        ["Repository CSV files", "Upload CSV files"],
+        horizontal=True,
+    )
 
     try:
-        if selected_source == "Upload CSV for this session":
-            uploaded_file = st.file_uploader("Upload a research-results CSV", type=["csv"])
-            if uploaded_file is None:
-                st.info("Choose a CSV file or select a repository file above.")
+        if source_mode == "Upload CSV files":
+            uploaded_files = st.file_uploader(
+                "Upload one or more research-results CSV files",
+                type=["csv"],
+                accept_multiple_files=True,
+            )
+            if not uploaded_files:
+                st.info("Upload one or more CSV files to begin.")
                 return
-            results = validate_research_results(pd.read_csv(uploaded_file))
-            st.caption(f"Loaded uploaded file: {uploaded_file.name}")
+            frames = [validate_research_results(pd.read_csv(uploaded_file)) for uploaded_file in uploaded_files]
+            source_names = [uploaded_file.name for uploaded_file in uploaded_files]
         else:
-            selected_path = available_files[source_options.index(selected_source)]
-            results = load_research_results(selected_path)
-            st.caption(f"Loaded: {selected_path}")
-            if selected_path.name.startswith("demo_"):
-                st.warning("Demo data only: these values are synthetic and must not be used in research conclusions.")
-    except (OSError, pd.errors.ParserError, ResearchResultsValidationError) as exc:
+            selected_paths = st.multiselect(
+                "Research result files",
+                available_files,
+                format_func=lambda path: path.name,
+            )
+            if not selected_paths:
+                st.info("Select one or more repository CSV files to begin.")
+                return
+            frames = [load_research_results(path) for path in selected_paths]
+            source_names = [path.name for path in selected_paths]
+            if any(path.name.startswith("demo_") for path in selected_paths):
+                st.warning("Demo data only: synthetic values must not be used in research conclusions.")
+        results = merge_research_results(frames)
+        st.caption("Loaded: " + ", ".join(source_names))
+    except (OSError, pd.errors.ParserError, ResearchResultsValidationError, ResearchAnalysisError) as exc:
         st.error(f"Could not load research results: {exc}")
         return
 
@@ -398,27 +704,44 @@ def show_research_mode() -> None:
     elif correctness == "Incorrect":
         filtered = filtered[~filtered["is_correct"]]
 
-    if filtered.empty:
-        st.warning("No rows match the selected filters.")
-        return
-
     filtered["dashboard_category"] = [
         _metric_category(metric, category)
         for metric, category in zip(filtered["metric_name"], filtered["metric_category"])
     ]
-    tabs = st.tabs([label for label, _ in DIMENSIONS])
-    for tab, (label, category) in zip(tabs, DIMENSIONS):
-        with tab:
-            category_rows = filtered[filtered["dashboard_category"] == category]
-            if category_rows.empty:
+    metric_sources = filtered.get("metric_source", pd.Series(None, index=filtered.index))
+    filtered["is_custom_check"] = [
+        _is_custom_check(metric, source)
+        for metric, source in zip(filtered["metric_name"], metric_sources)
+    ]
+    results_tab, dashboard_tab = st.tabs(["Results analysis", "Explore metrics"])
+    with results_tab:
+        _show_results_analysis(results)
+    with dashboard_tab:
+        if filtered.empty:
+            st.warning("No rows match the selected exploratory filters.")
+            return
+        tabs = st.tabs([label for label, _ in DIMENSIONS])
+        for tab, (label, category) in zip(tabs, DIMENSIONS):
+            with tab:
+                category_rows = (
+                    filtered[filtered["is_custom_check"]]
+                    if category == "custom"
+                    else filtered[filtered["dashboard_category"] == category]
+                )
+                if category_rows.empty:
+                    if category == "custom":
+                        st.info("No custom checks match the active filters.")
+                    else:
+                        st.info(f"No {label.lower()} metrics match the active filters.")
+                    continue
                 if category == "custom":
-                    st.info("No dataset-wide custom agreement metrics are available yet. This tab is reserved for future agreement checks.")
-                else:
-                    st.info(f"No {label.lower()} metrics match the active filters.")
-                continue
-            metrics = sorted(category_rows["metric_name"].unique())
-            selected_metric = metrics[0] if len(metrics) == 1 else st.selectbox("Metric", metrics, key=f"research-metric-{category}")
-            _show_metric_dashboard(_selected_metric_rows(category_rows, selected_metric), selected_metric)
+                    st.caption(
+                        "Supporting project-specific checks. Deletion is also shown under Faithfulness "
+                        "and stability under Robustness, where their values are interpreted."
+                    )
+                metrics = sorted(category_rows["metric_name"].unique())
+                selected_metric = metrics[0] if len(metrics) == 1 else st.selectbox("Metric", metrics, key=f"research-metric-{category}")
+                _show_metric_dashboard(_selected_metric_rows(category_rows, selected_metric), selected_metric)
 
 
 def show_xai(

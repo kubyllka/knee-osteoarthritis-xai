@@ -29,11 +29,14 @@ OPTIONAL_COLUMNS = (
     "metric_source",
     "score_direction",
     "metric_parameters",
+    "metric_status",
+    "metric_note",
 )
 
 VALID_METRIC_CATEGORIES = frozenset(
     {"faithfulness", "robustness", "complexity", "randomisation", "custom"}
 )
+VALID_METRIC_STATUSES = frozenset({"ok", "undefined_zero_perturbed_attribution"})
 
 
 class ResearchResultsValidationError(ValueError):
@@ -110,9 +113,37 @@ def validate_research_results(results: pd.DataFrame) -> pd.DataFrame:
     cleaned["is_correct"] = _normalise_boolean(cleaned["is_correct"], "is_correct")
     cleaned["error_distance"] = _integer_column(cleaned, "error_distance", 0, 4)
     cleaned["confidence"] = _finite_float_column(cleaned, "confidence", 0.0, 1.0)
-    cleaned["metric_value"] = _finite_float_column(cleaned, "metric_value")
 
-    correlation_rows = cleaned["metric_name"].eq("FaithfulnessCorrelation")
+    # Legacy files had no status column; all their finite values remain valid.
+    if "metric_status" not in cleaned.columns:
+        cleaned["metric_status"] = "ok"
+    cleaned["metric_status"] = cleaned["metric_status"].fillna("").astype(str).str.strip().str.lower()
+    invalid_statuses = sorted(set(cleaned["metric_status"]) - VALID_METRIC_STATUSES)
+    if invalid_statuses:
+        raise ResearchResultsValidationError(
+            "Unsupported metric_status values: " + ", ".join(invalid_statuses)
+        )
+
+    raw_metric_values = cleaned["metric_value"]
+    metric_values = pd.to_numeric(raw_metric_values, errors="coerce")
+    value_is_finite = metric_values.notna() & np.isfinite(metric_values)
+    undefined = cleaned["metric_status"].eq("undefined_zero_perturbed_attribution")
+    value_is_empty = raw_metric_values.isna() | raw_metric_values.astype(str).str.strip().eq("")
+    if (~undefined & ~value_is_finite).any() or (undefined & ~value_is_empty).any():
+        raise ResearchResultsValidationError(
+            "Column 'metric_value' must be finite for status 'ok' and empty for an undefined metric."
+        )
+    cleaned["metric_value"] = metric_values.astype(float)
+
+    if "metric_note" not in cleaned.columns:
+        cleaned["metric_note"] = pd.NA
+    cleaned["metric_note"] = cleaned["metric_note"].astype("string").str.strip()
+    if (undefined & (cleaned["metric_note"].isna() | cleaned["metric_note"].eq(""))).any():
+        raise ResearchResultsValidationError(
+            "An undefined metric row must include a non-empty 'metric_note'."
+        )
+
+    correlation_rows = cleaned["metric_name"].eq("FaithfulnessCorrelation") & ~undefined
     if not cleaned.loc[correlation_rows, "metric_value"].between(-1.0, 1.0).all():
         raise ResearchResultsValidationError(
             "FaithfulnessCorrelation metric_value must be between -1 and 1."
