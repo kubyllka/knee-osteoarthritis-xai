@@ -1,0 +1,5 @@
+[server]
+# PyTorch exposes torch.classes dynamically. On Windows, Streamlit's file
+# watcher may inspect it as a filesystem path and emit a misleading error.
+# Disable automatic source watching; restart Streamlit after code changes.
+fileWatcherType = "none"
