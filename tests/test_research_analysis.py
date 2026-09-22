@@ -4,13 +4,21 @@ import numpy as np
 import pandas as pd
 
 from app.research.analysis import (
+    ARCHITECTURE_MODELS,
+    METHOD_COMPARISON_METRICS,
     ResearchAnalysisError,
+    architecture_comparison_analysis,
+    architecture_complete_case_pairs,
     classifier_subset_summary,
     dunn_posthoc,
     epsilon_squared,
+    friedman_method_analysis,
     holm_adjust,
     kl_stage_analysis,
+    method_comparison_descriptives,
+    method_complete_case_matrices,
     merge_research_results,
+    wilcoxon_method_posthoc,
 )
 
 
@@ -45,6 +53,29 @@ def make_rows(method: str = "Grad-CAM", metric: str = "Deletion confidence drop"
                 "metric_note": None,
             })
     return pd.DataFrame(rows)
+
+
+def make_paired_rows(
+    model_name: str = "model-a", metric: str = "Deletion confidence drop", identical_first_pair: bool = False
+) -> pd.DataFrame:
+    methods = ["Grad-CAM", "Grad-CAM++", "Eigen-CAM", "Integrated Gradients", "SmoothGrad"]
+    frames = []
+    for position, method in enumerate(methods):
+        frame = make_rows(method=method, metric=metric).copy()
+        frame["model_name"] = model_name
+        # Each method receives a fixed offset, producing paired method differences.
+        # The optional first identical pair exercises Wilcoxon's all-zero safeguard.
+        offset = 0 if identical_first_pair and position == 1 else position
+        frame["metric_value"] = (frame["true_kl"] + 1) * 0.01 + offset * 0.1
+        frames.append(frame)
+    return pd.concat(frames, ignore_index=True)
+
+
+def make_architecture_rows(metric: str = "Deletion confidence drop") -> pd.DataFrame:
+    dense = make_paired_rows(model_name="densenet121", metric=metric)
+    resnet = make_paired_rows(model_name="resnet50", metric=metric)
+    resnet["metric_value"] = resnet["metric_value"] - 0.02
+    return pd.concat([dense, resnet], ignore_index=True)
 
 
 class ResearchAnalysisTests(unittest.TestCase):
@@ -98,6 +129,113 @@ class ResearchAnalysisTests(unittest.TestCase):
 
         self.assertEqual(len(posthoc), 10)
         self.assertTrue(posthoc["p Dunn-Holm"].between(0, 1).all())
+
+    def test_method_comparison_uses_complete_cases_for_every_method(self) -> None:
+        rows = make_paired_rows()
+        undefined = rows.index[(rows["xai_method"] == "Grad-CAM") & (rows["sample_id"] == "kl2-1")][0]
+        rows.loc[undefined, ["metric_value", "metric_status", "metric_note"]] = [
+            None,
+            "undefined_zero_perturbed_attribution",
+            "A perturbed input produced an all-zero attribution map.",
+        ]
+
+        matrices = method_complete_case_matrices(merge_research_results([rows]))
+        matrix = matrices[("model-a", "Deletion confidence drop")]
+        descriptives = method_comparison_descriptives(matrices)
+
+        self.assertEqual(len(matrix), 9)
+        self.assertEqual(matrix.attrs["candidate_n"], 10)
+        self.assertEqual(matrix.attrs["excluded_n"], 1)
+        self.assertTrue(descriptives["N"].eq(9).all())
+
+    def test_friedman_reports_kendalls_w_and_holm_per_model(self) -> None:
+        rows = pd.concat(
+            [make_paired_rows(metric=metric) for metric in METHOD_COMPARISON_METRICS],
+            ignore_index=True,
+        )
+        matrices = method_complete_case_matrices(merge_research_results([rows]))
+        summary = friedman_method_analysis(matrices)
+        deletion = summary[summary["Metric"].eq("Deletion confidence drop")].iloc[0]
+
+        expected_w = deletion["Friedman statistic"] / (deletion["Valid N"] * 4)
+        self.assertAlmostEqual(deletion["Kendall's W"], expected_w)
+        self.assertEqual(len(summary), 5)
+        self.assertTrue((summary["p Holm"] >= summary["p raw"]).all())
+        self.assertFalse(any("rank" in column.lower() for column in summary.columns))
+
+    def test_wilcoxon_outputs_ten_pairs_only_after_significant_friedman(self) -> None:
+        significant_rows = make_paired_rows(identical_first_pair=True)
+        nonsignificant_rows = make_paired_rows(metric="Sparseness")
+        for method in nonsignificant_rows["xai_method"].unique():
+            mask = nonsignificant_rows["xai_method"].eq(method)
+            nonsignificant_rows.loc[mask, "metric_value"] = make_rows()["metric_value"].to_numpy()
+        rows = pd.concat([significant_rows, nonsignificant_rows], ignore_index=True)
+        matrices = method_complete_case_matrices(merge_research_results([rows]))
+        summary = friedman_method_analysis(matrices)
+        summary.loc[summary["Metric"].eq("Deletion confidence drop"), "Friedman significant"] = True
+        summary.loc[summary["Metric"].eq("Sparseness"), "Friedman significant"] = False
+
+        posthoc = wilcoxon_method_posthoc(matrices, summary)
+
+        self.assertEqual(len(posthoc), 10)
+        self.assertTrue(posthoc["p Wilcoxon Holm"].between(0, 1).all())
+        zero_pair = posthoc[posthoc["Method pair"].eq("Grad-CAM vs Grad-CAM++")].iloc[0]
+        self.assertEqual(zero_pair["Test status"], "all paired differences zero")
+
+    def test_architecture_comparison_uses_only_complete_finite_pairs(self) -> None:
+        rows = make_architecture_rows()
+        undefined = rows.index[
+            (rows["model_name"] == "resnet50")
+            & (rows["xai_method"] == "Grad-CAM")
+            & (rows["sample_id"] == "kl2-1")
+        ][0]
+        rows.loc[undefined, ["metric_value", "metric_status", "metric_note"]] = [
+            None,
+            "undefined_zero_perturbed_attribution",
+            "A perturbed input produced an all-zero attribution map.",
+        ]
+
+        pairs = architecture_complete_case_pairs(merge_research_results([rows]))
+        matrix = pairs[("Grad-CAM", "Deletion confidence drop")]
+        summary = architecture_comparison_analysis(pairs)
+        result = summary[
+            summary["XAI method"].eq("Grad-CAM")
+            & summary["Metric"].eq("Deletion confidence drop")
+        ].iloc[0]
+
+        self.assertEqual(tuple(matrix.columns), ARCHITECTURE_MODELS)
+        self.assertEqual(len(matrix), 9)
+        self.assertEqual(matrix.attrs["candidate_n"], 10)
+        self.assertEqual(matrix.attrs["excluded_n"], 1)
+        self.assertEqual(int(result["Paired N"]), 9)
+        self.assertEqual(int(result["Excluded N"]), 1)
+        self.assertGreater(result["Median paired difference (DenseNet - ResNet)"], 0)
+        self.assertGreater(result["Rank-biserial correlation"], 0)
+
+    def test_architecture_same_target_sensitivity_uses_matching_predictions_only(self) -> None:
+        rows = make_architecture_rows()
+        mismatch = (rows["model_name"] == "resnet50") & (rows["sample_id"] == "kl1-0")
+        rows.loc[mismatch, ["predicted_kl", "target_class", "is_correct", "error_distance"]] = [2, 2, False, 1]
+
+        pairs = architecture_complete_case_pairs(merge_research_results([rows]), same_target_only=True)
+        matrix = pairs[("Grad-CAM", "Deletion confidence drop")]
+
+        self.assertEqual(matrix.attrs["candidate_n"], 9)
+        self.assertEqual(len(matrix), 9)
+        self.assertTrue(matrix.attrs["same_target_only"])
+
+    def test_architecture_holm_correction_covers_25_method_metric_tests(self) -> None:
+        rows = pd.concat(
+            [make_architecture_rows(metric=metric) for metric in METHOD_COMPARISON_METRICS],
+            ignore_index=True,
+        )
+        summary = architecture_comparison_analysis(
+            architecture_complete_case_pairs(merge_research_results([rows]))
+        )
+
+        self.assertEqual(len(summary), 25)
+        self.assertTrue((summary["p Holm"] >= summary["p raw"]).all())
+        self.assertFalse(any("winner" in column.lower() or "leaderboard" in column.lower() for column in summary.columns))
 
 
 if __name__ == "__main__":

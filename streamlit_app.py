@@ -23,11 +23,20 @@ from app.inference import ONNXKneeOsteoarthritisClassifier
 from app.metric_registry import is_legacy_metric, metric_definition, parse_parameters
 from app.quantus_metrics import evaluate_quantus_metrics
 from app.research.analysis import (
+    METHOD_COMPARISON_METRICS,
     ResearchAnalysisError,
+    architecture_comparison_analysis,
+    architecture_comparison_values,
+    architecture_complete_case_pairs,
     classifier_subset_summary,
     dunn_posthoc,
+    friedman_method_analysis,
     kl_stage_analysis,
+    method_comparison_descriptives,
+    method_comparison_values,
+    method_complete_case_matrices,
     merge_research_results,
+    wilcoxon_method_posthoc,
 )
 from app.research.results import ResearchResultsValidationError, load_research_results, validate_research_results
 from app.xai import generate_xai_visualization, load_xai_model_by_name, predict_kl_with_xai_model, preprocess_pil_for_torch
@@ -396,9 +405,16 @@ def _format_results_analysis_table(table: pd.DataFrame):
         "Kruskal–Wallis H": "{:.3f}",
         "epsilon squared": "{:.3f}",
         "p Dunn-Holm": "{:.3g}",
+        "Friedman statistic": "{:.3f}",
+        "Kendall's W": "{:.3f}",
+        "Wilcoxon statistic": "{:.3f}",
+        "p Wilcoxon raw": "{:.3g}",
+        "p Wilcoxon Holm": "{:.3g}",
+        "Rank-biserial correlation": "{:.3f}",
+        "Median paired difference (DenseNet - ResNet)": "{:.4g}",
     }
     for column in table.columns:
-        if any(column.endswith(suffix) for suffix in ("median", "Q1", "Q3", "IQR")):
+        if column in {"Median", "Q1", "Q3", "IQR"} or any(column.endswith(suffix) for suffix in ("median", "Q1", "Q3", "IQR")):
             formats[column] = "{:.4g}"
     return table.style.format(formats, na_rep="—")
 
@@ -529,6 +545,173 @@ def _effect_map_chart(effect_data: pd.DataFrame, model_name: str, scale_max: flo
     return (cells + labels).properties(title=model_name, height=260)
 
 
+def _method_comparison_plot_data(values: pd.DataFrame, metric_name: str, model_name: str) -> pd.DataFrame:
+    """Select one metric and model only; cross-metric plots are never valid."""
+    data = values[
+        values["Metric"].eq(metric_name) & values["Model"].eq(model_name)
+    ].copy()
+    data["XAI method"] = pd.Categorical(data["XAI method"], categories=XAI_METHODS, ordered=True)
+    return data.sort_values(["XAI method", "sample_id"]).reset_index(drop=True)
+
+
+def _method_comparison_y_scale(values: pd.DataFrame, metric_name: str) -> alt.Scale:
+    if metric_name == "FaithfulnessCorrelation":
+        return alt.Scale(domain=[-1, 1])
+    metric_values = pd.to_numeric(
+        values.loc[values["Metric"].eq(metric_name), "metric_value"], errors="coerce"
+    ).dropna()
+    if metric_values.empty:
+        return alt.Scale()
+    lower, upper = float(metric_values.min()), float(metric_values.max())
+    if metric_name == "MaxSensitivity":
+        # The current experiments contain positive values with a very long right
+        # tail. A logarithmic scale retains outliers without flattening all boxes.
+        return alt.Scale(type="log", domain=[lower * 0.8, upper * 1.2])
+    padding = max((upper - lower) * 0.08, abs(upper) * 0.04, 0.01)
+    return alt.Scale(domain=[lower - padding, upper + padding])
+
+
+def _method_comparison_chart(
+    values: pd.DataFrame,
+    descriptives: pd.DataFrame,
+    friedman_row: pd.Series,
+    metric_name: str,
+    model_name: str,
+    y_scale: alt.Scale,
+):
+    data = _method_comparison_plot_data(values, metric_name, model_name)
+    summary = descriptives[
+        descriptives["Metric"].eq(metric_name) & descriptives["Model"].eq(model_name)
+    ].copy()
+    summary["Valid N"] = int(friedman_row["Valid N"])
+    summary["Excluded N"] = int(friedman_row["Excluded N"])
+    summary["XAI method"] = pd.Categorical(summary["XAI method"], categories=XAI_METHODS, ordered=True)
+    summary["Median label"] = summary["Median"].map(lambda value: f"{value:.3g}")
+
+    color_scale = alt.Scale(
+        domain=XAI_METHODS,
+        range=["#2563eb", "#e76f51", "#7c3aed", "#0f766e", "#d97706"],
+    )
+    base = alt.Chart(data).encode(
+        x=alt.X("XAI method:N", title="XAI method", sort=XAI_METHODS, axis=alt.Axis(labelAngle=-30)),
+        color=alt.Color("XAI method:N", legend=None, scale=color_scale),
+    )
+    boxes = base.mark_boxplot(size=42).encode(
+        y=alt.Y(
+            "metric_value:Q",
+            title=f"{metric_name} (log scale)" if metric_name == "MaxSensitivity" else metric_name,
+            scale=y_scale,
+        ),
+    )
+    medians = alt.Chart(summary).mark_point(shape="diamond", filled=True, color="#111827", size=68).encode(
+        x=alt.X("XAI method:N", sort=XAI_METHODS),
+        y=alt.Y("Median:Q", scale=y_scale),
+        tooltip=[
+            alt.Tooltip("Model:N"),
+            alt.Tooltip("Metric:N"),
+            alt.Tooltip("XAI method:N"),
+            alt.Tooltip("N:Q"),
+            alt.Tooltip("Valid N:Q"),
+            alt.Tooltip("Excluded N:Q"),
+            alt.Tooltip("Median:Q", format=".4g"),
+            alt.Tooltip("Q1:Q", format=".4g"),
+            alt.Tooltip("Q3:Q", format=".4g"),
+            alt.Tooltip("IQR:Q", format=".4g"),
+        ],
+    )
+    labels = alt.Chart(summary).mark_text(dy=-13, color="#111827", fontSize=10).encode(
+        x=alt.X("XAI method:N", sort=XAI_METHODS),
+        y=alt.Y("Median:Q", scale=y_scale),
+        text="Median label:N",
+    )
+    return (boxes + medians + labels).properties(title=model_name, height=330)
+
+
+def _method_metric_caption(metric_name: str) -> str:
+    definition = metric_definition(metric_name)
+    if definition is None:
+        return "Metric metadata are unavailable."
+    if metric_name == "Sparseness":
+        return f"{definition.description} Concentration only: higher values are not automatically better."
+    if metric_name == "Deletion confidence drop":
+        return f"{definition.description} Higher is a stronger supporting faithfulness signal, but it is influenced partly by original model confidence."
+    if metric_name == "MaxSensitivity":
+        return f"{definition.description} Lower values are better. The Y-axis is logarithmic to retain the full positive range, including large outliers."
+    return f"{definition.description} {definition.score_direction.title()} values are better."
+
+
+def _architecture_comparison_plot_data(values: pd.DataFrame, metric_name: str) -> pd.DataFrame:
+    """Keep one metric scale in each architecture-comparison chart."""
+    data = values[values["Metric"].eq(metric_name)].copy()
+    data["XAI method"] = pd.Categorical(data["XAI method"], categories=XAI_METHODS, ordered=True)
+    data["Model"] = pd.Categorical(data["Model"], categories=["densenet121", "resnet50"], ordered=True)
+    return data.sort_values(["XAI method", "Model", "sample_id"]).reset_index(drop=True)
+
+
+def _architecture_median_summary(analysis: pd.DataFrame, metric_name: str) -> pd.DataFrame:
+    selected = analysis[analysis["Metric"].eq(metric_name)]
+    rows = []
+    for _, row_data in selected.iterrows():
+        for model_name, label in (("densenet121", "DenseNet121"), ("resnet50", "ResNet50")):
+            rows.append(
+                {
+                    "XAI method": row_data["XAI method"],
+                    "Model": model_name,
+                    "Model label": label,
+                    "Median": row_data[f"{label} median"],
+                    "Paired N": row_data["Paired N"],
+                    "Excluded N": row_data["Excluded N"],
+                }
+            )
+    summary = pd.DataFrame(rows)
+    if summary.empty:
+        return summary
+    summary["Median label"] = summary["Median"].map(lambda value: "—" if pd.isna(value) else f"{value:.3g}")
+    summary["XAI method"] = pd.Categorical(summary["XAI method"], categories=XAI_METHODS, ordered=True)
+    summary["Model"] = pd.Categorical(summary["Model"], categories=["densenet121", "resnet50"], ordered=True)
+    return summary.sort_values(["XAI method", "Model"]).reset_index(drop=True)
+
+
+def _architecture_comparison_chart(values: pd.DataFrame, analysis: pd.DataFrame, metric_name: str):
+    data = _architecture_comparison_plot_data(values, metric_name)
+    summary = _architecture_median_summary(analysis, metric_name)
+    y_scale = _method_comparison_y_scale(values, metric_name)
+    color_scale = alt.Scale(
+        domain=["densenet121", "resnet50"], range=["#e76f51", "#2563eb"]
+    )
+    base = alt.Chart(data).encode(
+        x=alt.X("XAI method:N", title="XAI method", sort=XAI_METHODS, axis=alt.Axis(labelAngle=-30)),
+        xOffset=alt.XOffset("Model:N", sort=["densenet121", "resnet50"]),
+        color=alt.Color("Model:N", title="Architecture", sort=["densenet121", "resnet50"], scale=color_scale),
+    )
+    boxes = base.mark_boxplot(size=30).encode(
+        y=alt.Y(
+            "metric_value:Q",
+            title=f"{metric_name} (log scale)" if metric_name == "MaxSensitivity" else metric_name,
+            scale=y_scale,
+        ),
+    )
+    medians = alt.Chart(summary).mark_point(shape="diamond", filled=True, color="#111827", size=48).encode(
+        x=alt.X("XAI method:N", sort=XAI_METHODS),
+        xOffset=alt.XOffset("Model:N", sort=["densenet121", "resnet50"]),
+        y=alt.Y("Median:Q", scale=y_scale),
+        tooltip=[
+            alt.Tooltip("Model label:N", title="Architecture"),
+            alt.Tooltip("XAI method:N"),
+            alt.Tooltip("Paired N:Q"),
+            alt.Tooltip("Excluded N:Q"),
+            alt.Tooltip("Median:Q", format=".4g"),
+        ],
+    )
+    labels = alt.Chart(summary).mark_text(dy=-11, color="#111827", fontSize=9).encode(
+        x=alt.X("XAI method:N", sort=XAI_METHODS),
+        xOffset=alt.XOffset("Model:N", sort=["densenet121", "resnet50"]),
+        y=alt.Y("Median:Q", scale=y_scale),
+        text="Median label:N",
+    )
+    return (boxes + medians + labels).properties(height=350)
+
+
 def _show_results_analysis(results: pd.DataFrame) -> None:
     st.subheader("Research overview")
     st.caption(
@@ -539,6 +722,10 @@ def _show_results_analysis(results: pd.DataFrame) -> None:
     try:
         classifier_summary, classifier_by_grade, confusion_matrices = classifier_subset_summary(results)
         analysis = kl_stage_analysis(results)
+        method_matrices = method_complete_case_matrices(results)
+        method_values = method_comparison_values(method_matrices)
+        method_descriptives = method_comparison_descriptives(method_matrices)
+        friedman_summary = friedman_method_analysis(method_matrices)
     except ResearchAnalysisError as exc:
         st.error(f"Results analysis cannot be calculated: {exc}")
         return
@@ -571,6 +758,135 @@ def _show_results_analysis(results: pd.DataFrame) -> None:
         "does not by itself establish an architecture difference. Sparseness describes concentration, while deletion is "
         "a supporting faithfulness check influenced partly by the original model confidence."
     )
+
+    st.markdown("#### XAI-method comparison")
+    st.caption(
+        "Each metric is analysed separately with paired complete-case samples. The five methods are evaluated on the "
+        "same images; no overall XAI score, method leaderboard, or KL-stratified method test is created here."
+    )
+    metric_tabs = st.tabs(list(METHOD_COMPARISON_METRICS))
+    for tab, metric_name in zip(metric_tabs, METHOD_COMPARISON_METRICS):
+        with tab:
+            st.caption(_method_metric_caption(metric_name))
+            metric_tests = friedman_summary[friedman_summary["Metric"].eq(metric_name)]
+            if metric_tests.empty or method_values[method_values["Metric"].eq(metric_name)].empty:
+                st.info("No complete paired values are available for this metric in the loaded files.")
+                continue
+            model_columns = st.columns(min(len(metric_tests), 2))
+            y_scale = _method_comparison_y_scale(method_values, metric_name)
+            for index, (_, test_row) in enumerate(metric_tests.iterrows()):
+                with model_columns[index % len(model_columns)]:
+                    st.caption(
+                        f"Complete paired samples: {int(test_row['Valid N'])}; "
+                        f"excluded: {int(test_row['Excluded N'])}."
+                    )
+                    st.altair_chart(
+                        _method_comparison_chart(
+                            method_values,
+                            method_descriptives,
+                            test_row,
+                            metric_name,
+                            str(test_row["Model"]),
+                            y_scale,
+                        ),
+                        use_container_width=True,
+                    )
+            st.markdown("**Complete-case descriptive summary**")
+            metric_descriptives = method_descriptives[method_descriptives["Metric"].eq(metric_name)]
+            st.dataframe(_format_results_analysis_table(metric_descriptives), use_container_width=True, hide_index=True)
+
+    with st.expander("Friedman XAI-method statistics"):
+        st.caption(
+            "Each test compares the five paired XAI methods within one model and metric. "
+            "Holm correction is applied across the five metric-level Friedman tests separately for each model. "
+            "Kendall's W = χ² / (N × 4)."
+        )
+        st.dataframe(_format_results_analysis_table(friedman_summary), use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download Friedman XAI-method summary CSV",
+            data=friedman_summary.to_csv(index=False).encode("utf-8"),
+            file_name="friedman_xai_method_analysis.csv",
+            mime="text/csv",
+        )
+
+    with st.expander("Wilcoxon post-hoc method pairs"):
+        posthoc_methods = wilcoxon_method_posthoc(method_matrices, friedman_summary)
+        if posthoc_methods.empty:
+            st.info("No Holm-significant Friedman result is available for pairwise XAI-method comparison.")
+        else:
+            st.caption(
+                "Two-sided paired Wilcoxon signed-rank tests are shown only after a Holm-significant Friedman test. "
+                "Holm correction is applied across the ten method pairs within that metric."
+            )
+            st.dataframe(_format_results_analysis_table(posthoc_methods), use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download Wilcoxon XAI-method pairs CSV",
+                data=posthoc_methods.to_csv(index=False).encode("utf-8"),
+                file_name="wilcoxon_xai_method_pairs.csv",
+                mime="text/csv",
+            )
+
+    st.markdown("#### Architecture comparison")
+    st.caption(
+        "DenseNet121 and ResNet50 are compared only on the same image, XAI method, and metric. "
+        "Each metric remains separate: this section does not create an overall architecture winner."
+    )
+    try:
+        architecture_primary_pairs = architecture_complete_case_pairs(results)
+        architecture_same_target_pairs = architecture_complete_case_pairs(results, same_target_only=True)
+    except ResearchAnalysisError as exc:
+        st.info(f"Architecture comparison is unavailable: {exc}")
+    else:
+        architecture_mode = st.radio(
+            "Architecture comparison mode",
+            ["Primary: all paired samples", "Sensitivity: same predicted KL target"],
+            horizontal=True,
+        )
+        sensitivity_mode = architecture_mode.startswith("Sensitivity")
+        architecture_pairs = (
+            architecture_same_target_pairs if sensitivity_mode else architecture_primary_pairs
+        )
+        architecture_values = architecture_comparison_values(architecture_pairs)
+        architecture_summary = architecture_comparison_analysis(architecture_pairs)
+        if sensitivity_mode:
+            st.warning(
+                "Sensitivity analysis: only images for which DenseNet121 and ResNet50 predicted the same KL class are retained. "
+                "This reduces confounding from different XAI target classes, but analyses a smaller selected cohort."
+            )
+        else:
+            st.caption(
+                "Primary analysis includes every complete finite pair, even when the two models predicted different KL classes."
+            )
+
+        architecture_tabs = st.tabs(list(METHOD_COMPARISON_METRICS))
+        for tab, metric_name in zip(architecture_tabs, METHOD_COMPARISON_METRICS):
+            with tab:
+                st.caption(_method_metric_caption(metric_name))
+                metric_values = architecture_values[architecture_values["Metric"].eq(metric_name)]
+                if metric_values.empty:
+                    st.info("No complete architecture pairs are available for this metric.")
+                    continue
+                st.altair_chart(
+                    _architecture_comparison_chart(architecture_values, architecture_summary, metric_name),
+                    use_container_width=True,
+                )
+                metric_summary = architecture_summary[architecture_summary["Metric"].eq(metric_name)]
+                st.dataframe(_format_results_analysis_table(metric_summary), use_container_width=True, hide_index=True)
+
+        with st.expander("Architecture-comparison Wilcoxon statistics"):
+            st.caption(
+                "One two-sided paired Wilcoxon signed-rank test is calculated per XAI method × metric. "
+                "Holm correction is applied across all 25 architecture-comparison tests. Positive median paired differences "
+                "and rank-biserial correlations mean higher DenseNet121 values (DenseNet121 − ResNet50)."
+            )
+            st.dataframe(_format_results_analysis_table(architecture_summary), use_container_width=True, hide_index=True)
+            suffix = "same_target" if sensitivity_mode else "all_pairs"
+            st.download_button(
+                "Download architecture-comparison CSV",
+                data=architecture_summary.to_csv(index=False).encode("utf-8"),
+                file_name=f"architecture_comparison_{suffix}.csv",
+                mime="text/csv",
+            )
 
     grade_n_columns = [f"KL{grade} n" for grade in range(5)]
     tests_per_model = analysis.groupby("Model").size()

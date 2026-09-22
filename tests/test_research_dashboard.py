@@ -10,6 +10,8 @@ from streamlit_app import (
     _effect_map_scale_max,
     _is_custom_check,
     _median_by_method_and_grade,
+    _method_comparison_plot_data,
+    _method_comparison_y_scale,
     _selected_metric_rows,
     _summary_card_values,
 )
@@ -166,6 +168,35 @@ class ResearchDashboardAndRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(_effect_map_scale_max(analysis), 0.52)
+
+    def test_method_comparison_plot_data_never_mixes_metrics(self) -> None:
+        values = pd.DataFrame(
+            [
+                {"Model": "resnet50", "Metric": "MaxSensitivity", "sample_id": "one", "XAI method": "Grad-CAM", "metric_value": 0.2},
+                {"Model": "resnet50", "Metric": "Sparseness", "sample_id": "one", "XAI method": "Grad-CAM", "metric_value": 0.8},
+                {"Model": "densenet121", "Metric": "MaxSensitivity", "sample_id": "one", "XAI method": "Grad-CAM", "metric_value": 0.3},
+            ]
+        )
+
+        data = _method_comparison_plot_data(values, "MaxSensitivity", "resnet50")
+
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data["Metric"].iloc[0], "MaxSensitivity")
+        self.assertEqual(data["Model"].iloc[0], "resnet50")
+        self.assertFalse(any("rank" in column.lower() for column in data.columns))
+
+    def test_max_sensitivity_uses_a_logarithmic_y_axis(self) -> None:
+        values = pd.DataFrame(
+            {
+                "Metric": ["MaxSensitivity", "MaxSensitivity"],
+                "metric_value": [0.15, 311930.125],
+            }
+        )
+
+        scale = _method_comparison_y_scale(values, "MaxSensitivity")
+
+        self.assertEqual(scale.to_dict()["type"], "log")
+        self.assertGreater(scale.to_dict()["domain"][0], 0)
 
 
 if __name__ == "__main__":
