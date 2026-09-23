@@ -36,6 +36,8 @@ from app.research.analysis import (
     method_comparison_values,
     method_complete_case_matrices,
     merge_research_results,
+    prediction_correctness_analysis,
+    prediction_correctness_values,
     wilcoxon_method_posthoc,
 )
 from app.research.results import ResearchResultsValidationError, load_research_results, validate_research_results
@@ -412,6 +414,9 @@ def _format_results_analysis_table(table: pd.DataFrame):
         "p Wilcoxon Holm": "{:.3g}",
         "Rank-biserial correlation": "{:.3f}",
         "Median paired difference (DenseNet - ResNet)": "{:.4g}",
+        "Mann–Whitney U": "{:.3f}",
+        "KL-adjusted permutation p raw": "{:.3g}",
+        "KL-adjusted permutation p Holm": "{:.3g}",
     }
     for column in table.columns:
         if column in {"Median", "Q1", "Q3", "IQR"} or any(column.endswith(suffix) for suffix in ("median", "Q1", "Q3", "IQR")):
@@ -712,6 +717,104 @@ def _architecture_comparison_chart(values: pd.DataFrame, analysis: pd.DataFrame,
     return (boxes + medians + labels).properties(height=350)
 
 
+def _correctness_effect_heatmap_data(
+    analysis: pd.DataFrame, model_name: str, *, kl_adjusted: bool
+) -> pd.DataFrame:
+    selected = analysis[analysis["Model"].eq(model_name)].copy()
+    keys = ["Metric", "XAI method"]
+    grid = pd.MultiIndex.from_product(
+        [METHOD_COMPARISON_METRICS, XAI_METHODS], names=keys
+    ).to_frame(index=False)
+    data = grid.merge(selected, on=keys, how="left")
+    p_raw = "KL-adjusted permutation p raw" if kl_adjusted else "p raw"
+    p_holm = "KL-adjusted permutation p Holm" if kl_adjusted else "p Holm"
+    significant = "KL-adjusted significant" if kl_adjusted else "Primary significant"
+    data["Selected raw p"] = data[p_raw]
+    data["Selected Holm p"] = data[p_holm]
+    data["Selected significant"] = data[significant].eq(True)
+    data["Effect label"] = data.apply(
+        lambda row: "—" if pd.isna(row["Rank-biserial correlation"])
+        else f"{float(row['Rank-biserial correlation']):.2f}{'*' if bool(row['Selected significant']) else ''}",
+        axis=1,
+    )
+    data["Metric"] = pd.Categorical(data["Metric"], METHOD_COMPARISON_METRICS, ordered=True)
+    data["XAI method"] = pd.Categorical(data["XAI method"], XAI_METHODS, ordered=True)
+    return data.sort_values(["Metric", "XAI method"]).reset_index(drop=True)
+
+
+def _correctness_effect_heatmap(data: pd.DataFrame, model_name: str):
+    color = alt.condition(
+        "isValid(datum['Rank-biserial correlation'])",
+        alt.Color(
+            "Rank-biserial correlation:Q",
+            title="Correct − incorrect rank-biserial effect",
+            scale=alt.Scale(domain=[-1, 1], scheme="redblue"),
+        ),
+        alt.value("#edf0f4"),
+    )
+    base = alt.Chart(data).encode(
+        x=alt.X("XAI method:N", title=None, sort=XAI_METHODS, axis=alt.Axis(labelAngle=-35)),
+        y=alt.Y("Metric:N", title=None, sort=METHOD_COMPARISON_METRICS),
+    )
+    cells = base.mark_rect(cornerRadius=3).encode(
+        color=color,
+        tooltip=[
+            alt.Tooltip("Metric:N"),
+            alt.Tooltip("XAI method:N"),
+            alt.Tooltip("Correct N:Q"),
+            alt.Tooltip("Incorrect N:Q"),
+            alt.Tooltip("Excluded N:Q"),
+            alt.Tooltip("Correct median:Q", format=".4g"),
+            alt.Tooltip("Incorrect median:Q", format=".4g"),
+            alt.Tooltip("Rank-biserial correlation:Q", format=".3f"),
+            alt.Tooltip("Selected raw p:Q", format=".3g"),
+            alt.Tooltip("Selected Holm p:Q", format=".3g"),
+        ],
+    )
+    labels = base.mark_text(fontSize=11).encode(
+        text="Effect label:N",
+        color=alt.condition(
+            "abs(datum['Rank-biserial correlation']) >= 0.45", alt.value("white"), alt.value("#1f2937")
+        ),
+    )
+    return (cells + labels).properties(title=model_name, height=260)
+
+
+def _correctness_distribution_chart(
+    values: pd.DataFrame,
+    analysis_row: pd.Series,
+    metric_name: str,
+):
+    data = values[
+        values["Model"].eq(analysis_row["Model"])
+        & values["XAI method"].eq(analysis_row["XAI method"])
+        & values["Metric"].eq(metric_name)
+    ].copy()
+    data["Prediction outcome"] = data["Correct"].map({True: "Correct", False: "Incorrect"})
+    data["Prediction outcome"] = pd.Categorical(
+        data["Prediction outcome"], categories=["Incorrect", "Correct"], ordered=True
+    )
+    y_scale = _method_comparison_y_scale(data, metric_name)
+    return alt.Chart(data).mark_boxplot(size=55).encode(
+        x=alt.X("Prediction outcome:N", title="Prediction outcome", sort=["Incorrect", "Correct"]),
+        y=alt.Y(
+            "metric_value:Q",
+            title=f"{metric_name} (log scale)" if metric_name == "MaxSensitivity" else metric_name,
+            scale=y_scale,
+        ),
+        color=alt.Color(
+            "Prediction outcome:N",
+            legend=None,
+            scale=alt.Scale(domain=["Incorrect", "Correct"], range=["#e76f51", "#2563eb"]),
+        ),
+        tooltip=[
+            alt.Tooltip("Prediction outcome:N"),
+            alt.Tooltip("metric_value:Q", format=".4g"),
+            alt.Tooltip("true_kl:Q", title="True KL grade"),
+        ],
+    ).properties(height=340)
+
+
 def _show_results_analysis(results: pd.DataFrame) -> None:
     st.subheader("Research overview")
     st.caption(
@@ -885,6 +988,88 @@ def _show_results_analysis(results: pd.DataFrame) -> None:
                 "Download architecture-comparison CSV",
                 data=architecture_summary.to_csv(index=False).encode("utf-8"),
                 file_name=f"architecture_comparison_{suffix}.csv",
+                mime="text/csv",
+            )
+
+    st.markdown("#### Prediction correctness analysis")
+    st.caption(
+        "Correctness is derived as predicted KL = true KL. Each comparison remains within one model, XAI method, "
+        "and metric; a significant result is not evidence that an explanation is faithful or clinically valid."
+    )
+    try:
+        correctness_values = prediction_correctness_values(results)
+        correctness_summary = prediction_correctness_analysis(results)
+    except ResearchAnalysisError as exc:
+        st.info(f"Prediction correctness analysis is unavailable: {exc}")
+    else:
+        correctness_mode = st.radio(
+            "Prediction correctness analysis mode",
+            ["Primary: pooled correct vs incorrect", "KL-adjusted sensitivity: stratified permutation"],
+            horizontal=True,
+        )
+        kl_adjusted_mode = correctness_mode.startswith("KL-adjusted")
+        if kl_adjusted_mode:
+            st.warning(
+                "KL-adjusted sensitivity analysis shuffles correctness labels only within each true-KL stratum, preserving "
+                "stratum-specific group sizes. It tests whether the pooled effect remains after accounting for KL composition."
+            )
+        else:
+            st.caption(
+                "Primary analysis compares all valid correct and incorrect predictions for the selected model × method × metric."
+            )
+
+        st.caption(
+            "Heatmap values are pooled rank-biserial effects (correct − incorrect): positive means correct predictions have "
+            "higher metric values. A * marks Holm significance in the selected mode; whether higher is preferable depends on the metric."
+        )
+        correctness_models = sorted(correctness_summary["Model"].unique())
+        heatmap_columns = st.columns(min(len(correctness_models), 2))
+        for index, model_name in enumerate(correctness_models):
+            with heatmap_columns[index % len(heatmap_columns)]:
+                heatmap_data = _correctness_effect_heatmap_data(
+                    correctness_summary, model_name, kl_adjusted=kl_adjusted_mode
+                )
+                st.altair_chart(_correctness_effect_heatmap(heatmap_data, model_name), use_container_width=True)
+
+        st.markdown("**Individual distribution**")
+        selectors = st.columns(3)
+        selected_model = selectors[0].selectbox(
+            "Model", correctness_models, key="correctness-distribution-model"
+        )
+        selected_metric = selectors[1].selectbox(
+            "Metric", list(METHOD_COMPARISON_METRICS), key="correctness-distribution-metric"
+        )
+        selected_method = selectors[2].selectbox(
+            "XAI method", XAI_METHODS, key="correctness-distribution-method"
+        )
+        selected_test = correctness_summary[
+            correctness_summary["Model"].eq(selected_model)
+            & correctness_summary["Metric"].eq(selected_metric)
+            & correctness_summary["XAI method"].eq(selected_method)
+        ].iloc[0]
+        st.altair_chart(
+            _correctness_distribution_chart(correctness_values, selected_test, selected_metric),
+            use_container_width=True,
+        )
+        selected_p = (
+            selected_test["KL-adjusted permutation p Holm"]
+            if kl_adjusted_mode else selected_test["p Holm"]
+        )
+        st.caption(
+            f"Correct N: {int(selected_test['Correct N'])}; incorrect N: {int(selected_test['Incorrect N'])}; "
+            f"excluded: {int(selected_test['Excluded N'])}; Holm-adjusted p: {selected_p:.3g}."
+        )
+
+        with st.expander("Prediction-correctness statistics"):
+            st.caption(
+                "The table includes primary Mann–Whitney and KL-adjusted permutation results. "
+                "Holm correction is applied separately across 25 tests for each model in each analysis mode."
+            )
+            st.dataframe(_format_results_analysis_table(correctness_summary), use_container_width=True, hide_index=True)
+            st.download_button(
+                "Download prediction-correctness analysis CSV",
+                data=correctness_summary.to_csv(index=False).encode("utf-8"),
+                file_name="prediction_correctness_analysis.csv",
                 mime="text/csv",
             )
 

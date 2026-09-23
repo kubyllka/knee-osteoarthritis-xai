@@ -57,6 +57,99 @@ def _model_device(model: torch.nn.Module) -> torch.device:
     return next(model.parameters(), torch.empty(0)).device
 
 
+def perturb_spatial_pixels_all_channels(
+    input_array: np.ndarray,
+    spatial_indices: np.ndarray,
+    baseline: np.ndarray | None = None,
+) -> np.ndarray:
+    """Replace selected ``(y, x)`` pixels in every input channel together.
+
+    XAI maps in this project contain one importance value per spatial image
+    location. A perturbation of such a feature must therefore affect the RGB
+    values at that location together, rather than accidentally treating the
+    first input channel as the complete image.
+    """
+    if input_array.ndim != 4:
+        raise ValueError("Spatial perturbation expects shape (batch, channels, height, width).")
+
+    batch_size, channels, height, width = input_array.shape
+    indices = np.asarray(spatial_indices, dtype=np.int64)
+    if indices.ndim == 1:
+        indices = np.broadcast_to(indices, (batch_size, len(indices)))
+    if indices.ndim != 2 or indices.shape[0] != batch_size:
+        raise ValueError("spatial_indices must have one flattened-position row per image.")
+    if indices.shape[1] == 0 or np.any(indices < 0) or np.any(indices >= height * width):
+        raise ValueError("spatial_indices must contain valid flattened image positions.")
+
+    if baseline is None:
+        # The model receives ImageNet-normalised tensors, so use a per-channel
+        # mean in that same input space. This preserves the channel-specific
+        # normalisation while removing local spatial evidence.
+        baseline = input_array.mean(axis=(2, 3), keepdims=True)
+    if baseline.shape != (batch_size, channels, 1, 1):
+        raise ValueError("baseline must have shape (batch, channels, 1, 1).")
+
+    perturbed = input_array.copy()
+    for sample_index, sample_indices in enumerate(indices):
+        rows = sample_indices // width
+        columns = sample_indices % width
+        # NumPy places the advanced spatial index before the channel axis, so
+        # the indexed result is (selected_pixels, channels).
+        perturbed[sample_index, :, rows, columns] = baseline[sample_index, :, 0, 0][np.newaxis, :]
+    return perturbed
+
+
+def spatial_faithfulness_correlation(
+    model: torch.nn.Module,
+    input_tensor: torch.Tensor,
+    attribution: np.ndarray,
+    target_class: int,
+    nr_runs: int,
+    subset_size: int,
+) -> float:
+    """Faithfulness correlation with one feature per spatial RGB location.
+
+    Quantus expands a one-channel attribution map to RGB before its standard
+    implementation samples features. That makes an individual channel value,
+    rather than a spatial image location, the selected feature. This explicit
+    implementation retains Quantus' correlation principle but samples from the
+    2-D map directly and replaces every selected location in all RGB channels.
+    """
+    if input_tensor.ndim != 4 or input_tensor.shape[0] != 1:
+        raise ValueError("FaithfulnessCorrelation currently supports one image with shape (1, channels, height, width).")
+    if attribution.ndim != 2 or tuple(attribution.shape) != tuple(input_tensor.shape[-2:]):
+        raise ValueError("attribution spatial dimensions must match the model input.")
+
+    flat_attribution = attribution.astype(np.float64, copy=False).reshape(-1)
+    maximum = np.max(np.abs(flat_attribution))
+    if not np.isfinite(maximum) or np.isclose(maximum, 0.0):
+        raise ValueError("FaithfulnessCorrelation requires a finite, non-zero attribution map.")
+    if not 0 < subset_size < len(flat_attribution):
+        raise ValueError("subset_size must be between 1 and the number of spatial image pixels minus one.")
+
+    normalised_attribution = flat_attribution / maximum
+    input_array = input_tensor.detach().cpu().numpy().astype(np.float32, copy=False)
+    baseline = input_array.mean(axis=(2, 3), keepdims=True)
+    model.eval()
+    with torch.no_grad():
+        original_score = float(model(input_tensor)[0, target_class].item())
+
+    attribution_sums: list[float] = []
+    prediction_deltas: list[float] = []
+    for _ in range(nr_runs):
+        selected = np.random.choice(len(flat_attribution), subset_size, replace=False)
+        perturbed_array = perturb_spatial_pixels_all_channels(input_array, selected, baseline)
+        perturbed_tensor = torch.from_numpy(perturbed_array).to(device=input_tensor.device, dtype=input_tensor.dtype)
+        with torch.no_grad():
+            perturbed_score = float(model(perturbed_tensor)[0, target_class].item())
+        attribution_sums.append(float(normalised_attribution[selected].sum()))
+        prediction_deltas.append(original_score - perturbed_score)
+
+    if np.isclose(np.std(attribution_sums), 0.0) or np.isclose(np.std(prediction_deltas), 0.0):
+        return float("nan")
+    return float(np.corrcoef(attribution_sums, prediction_deltas)[0, 1])
+
+
 def evaluate_quantus_metrics(
     model: torch.nn.Module,
     input_tensor: torch.Tensor,
@@ -96,21 +189,16 @@ def evaluate_quantus_metrics(
     metric_scores: dict[str, object] = {}
     metric_statuses: dict[str, str] = {}
     metric_notes: dict[str, str] = {}
-    metric_scores["FaithfulnessCorrelation"] = quantus.FaithfulnessCorrelation(
+    metric_scores["FaithfulnessCorrelation"] = [
+        spatial_faithfulness_correlation(
+            model=model,
+            input_tensor=input_tensor,
+            attribution=attribution,
+            target_class=target_class,
             nr_runs=faithfulness_runs,
             subset_size=subset_size,
-            abs=False,
-            normalise=True,
-            perturb_baseline="mean",
-            disable_warnings=True,
-        )(
-            model=model,
-            x_batch=x_batch,
-            y_batch=y_batch,
-            a_batch=a_batch,
-            channel_first=True,
-            device=device,
         )
+    ]
     try:
         metric_scores["MaxSensitivity"] = quantus.MaxSensitivity(
             nr_samples=max_sensitivity_samples,
@@ -154,7 +242,11 @@ def evaluate_quantus_metrics(
             "abs": False,
             "nr_runs": faithfulness_runs,
             "subset_size": subset_size,
-            "perturb_baseline": "mean",
+            "feature_unit": "spatial_pixel_rgb_group",
+            "perturbation": "replace_selected_spatial_pixels_in_all_channels",
+            "perturb_baseline": "per_channel_input_mean",
+            "similarity": "pearson_correlation",
+            "implementation": "spatial_rgb_grouped_faithfulness_correlation_v1",
             "model_output": model_output,
             "xai_target": "predicted_kl_class_score" if is_ordinal else "predicted_class_logit",
         },

@@ -18,6 +18,10 @@ from app.research.analysis import (
     method_comparison_descriptives,
     method_complete_case_matrices,
     merge_research_results,
+    prediction_correctness_analysis,
+    prediction_correctness_values,
+    stratified_correctness_permutation_p_value,
+    _stratified_permuted_correctness_labels,
     wilcoxon_method_posthoc,
 )
 
@@ -76,6 +80,19 @@ def make_architecture_rows(metric: str = "Deletion confidence drop") -> pd.DataF
     resnet = make_paired_rows(model_name="resnet50", metric=metric)
     resnet["metric_value"] = resnet["metric_value"] - 0.02
     return pd.concat([dense, resnet], ignore_index=True)
+
+
+def make_correctness_rows(model_name: str = "model-a") -> pd.DataFrame:
+    frames = []
+    methods = ["Grad-CAM", "Grad-CAM++", "Eigen-CAM", "Integrated Gradients", "SmoothGrad"]
+    for metric in METHOD_COMPARISON_METRICS:
+        for position, method in enumerate(methods):
+            frame = make_rows(method=method, metric=metric).copy()
+            frame["model_name"] = model_name
+            correct = frame["predicted_kl"].eq(frame["true_kl"])
+            frame["metric_value"] = 0.05 + position * 0.02 + frame["true_kl"] * 0.01 + correct * 0.2
+            frames.append(frame)
+    return pd.concat(frames, ignore_index=True)
 
 
 class ResearchAnalysisTests(unittest.TestCase):
@@ -236,6 +253,66 @@ class ResearchAnalysisTests(unittest.TestCase):
         self.assertEqual(len(summary), 25)
         self.assertTrue((summary["p Holm"] >= summary["p raw"]).all())
         self.assertFalse(any("winner" in column.lower() or "leaderboard" in column.lower() for column in summary.columns))
+
+    def test_correctness_analysis_reports_groups_exclusions_and_positive_effect(self) -> None:
+        rows = make_correctness_rows()
+        undefined = rows.index[
+            (rows["xai_method"] == "Grad-CAM")
+            & (rows["metric_name"] == "Deletion confidence drop")
+            & (rows["sample_id"] == "kl2-1")
+        ][0]
+        rows.loc[undefined, ["metric_value", "metric_status", "metric_note"]] = [
+            None,
+            "undefined_zero_perturbed_attribution",
+            "A perturbed input produced an all-zero attribution map.",
+        ]
+        results = merge_research_results([rows])
+        values = prediction_correctness_values(results)
+        summary = prediction_correctness_analysis(results, permutations=50)
+        result = summary[
+            summary["XAI method"].eq("Grad-CAM")
+            & summary["Metric"].eq("Deletion confidence drop")
+        ].iloc[0]
+
+        self.assertEqual(len(values[values["Metric"].eq("Deletion confidence drop")]), 49)
+        self.assertEqual(int(result["Correct N"]) + int(result["Incorrect N"]), 9)
+        self.assertEqual(int(result["Excluded N"]), 1)
+        self.assertGreater(result["Correct median"], result["Incorrect median"])
+        self.assertGreater(result["Rank-biserial correlation"], 0)
+
+    def test_stratified_permutations_preserve_kl_group_counts_and_are_reproducible(self) -> None:
+        true_kl = np.array([0, 0, 0, 1, 1, 1, 2, 2])
+        labels = np.array([True, True, False, True, False, False, True, False])
+        first = _stratified_permuted_correctness_labels(
+            true_kl, labels, permutations=25, rng=np.random.default_rng(42)
+        )
+        second = _stratified_permuted_correctness_labels(
+            true_kl, labels, permutations=25, rng=np.random.default_rng(42)
+        )
+
+        self.assertTrue(np.array_equal(first, second))
+        for grade in np.unique(true_kl):
+            self.assertTrue((first[:, true_kl == grade].sum(axis=1) == labels[true_kl == grade].sum()).all())
+
+    def test_stratified_permutation_uses_two_sided_plus_one_correction(self) -> None:
+        values = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+        true_kl = np.array([0, 0, 0, 1, 1, 1])
+        labels = np.array([True, True, False, True, False, False])
+        p_first = stratified_correctness_permutation_p_value(values, true_kl, labels, seed=42, permutations=100)
+        p_second = stratified_correctness_permutation_p_value(values, true_kl, labels, seed=42, permutations=100)
+
+        self.assertEqual(p_first, p_second)
+        self.assertGreaterEqual(p_first, 1 / 101)
+        self.assertAlmostEqual(p_first * 101, round(p_first * 101))
+
+    def test_correctness_holm_is_separate_per_model_and_never_mixes_metrics(self) -> None:
+        rows = pd.concat([make_correctness_rows("model-a"), make_correctness_rows("model-b")], ignore_index=True)
+        summary = prediction_correctness_analysis(merge_research_results([rows]), permutations=20)
+
+        self.assertEqual(len(summary), 50)
+        self.assertTrue(summary.groupby("Model").size().eq(25).all())
+        self.assertTrue((summary["p Holm"] >= summary["p raw"]).all())
+        self.assertTrue((summary["KL-adjusted permutation p Holm"] >= summary["KL-adjusted permutation p raw"]).all())
 
 
 if __name__ == "__main__":

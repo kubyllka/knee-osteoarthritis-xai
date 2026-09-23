@@ -6,6 +6,7 @@ import pandas as pd
 from app.metric_registry import metric_definition
 from streamlit_app import (
     _classifier_accuracy_chart_data,
+    _correctness_effect_heatmap_data,
     _effect_map_data,
     _effect_map_scale_max,
     _is_custom_check,
@@ -197,6 +198,38 @@ class ResearchDashboardAndRunnerTests(unittest.TestCase):
 
         self.assertEqual(scale.to_dict()["type"], "log")
         self.assertGreater(scale.to_dict()["domain"][0], 0)
+
+    def test_correctness_heatmap_has_one_cell_per_metric_method_without_pooling(self) -> None:
+        summary = pd.DataFrame(
+            [
+                {
+                    "Model": "resnet50",
+                    "Metric": "MaxSensitivity",
+                    "XAI method": "Grad-CAM",
+                    "Correct N": 10,
+                    "Incorrect N": 5,
+                    "Excluded N": 1,
+                    "Correct median": 0.4,
+                    "Incorrect median": 0.8,
+                    "Rank-biserial correlation": -0.5,
+                    "p raw": 0.01,
+                    "p Holm": 0.02,
+                    "Primary significant": True,
+                    "KL-adjusted permutation p raw": 0.03,
+                    "KL-adjusted permutation p Holm": 0.04,
+                    "KL-adjusted significant": True,
+                }
+            ]
+        )
+
+        data = _correctness_effect_heatmap_data(summary, "resnet50", kl_adjusted=True)
+
+        self.assertEqual(len(data), 25)
+        selected = data[
+            data["Metric"].eq("MaxSensitivity") & data["XAI method"].eq("Grad-CAM")
+        ].iloc[0]
+        self.assertEqual(selected["Effect label"], "-0.50*")
+        self.assertEqual(selected["Selected Holm p"], 0.04)
 
 
 if __name__ == "__main__":

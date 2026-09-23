@@ -4,7 +4,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from app.quantus_metrics import evaluate_quantus_metrics
+from app.quantus_metrics import evaluate_quantus_metrics, perturb_spatial_pixels_all_channels
 
 
 class TinyClassifier(torch.nn.Module):
@@ -14,6 +14,25 @@ class TinyClassifier(torch.nn.Module):
 
 
 class QuantusMetricsTests(unittest.TestCase):
+    def test_spatial_faithfulness_perturbation_replaces_all_rgb_channels(self) -> None:
+        """A selected spatial feature must never perturb just one RGB channel."""
+        image = np.arange(12, dtype=np.float32).reshape(1, 3, 2, 2)
+        baseline = np.array([[[[100.0]], [[200.0]], [[300.0]]]], dtype=np.float32)
+
+        # Flattened spatial positions 1 and 2 are (0, 1) and (1, 0).
+        perturbed = perturb_spatial_pixels_all_channels(
+            image,
+            spatial_indices=np.array([1, 2]),
+            baseline=baseline,
+        )
+
+        expected_rgb = np.array([100.0, 200.0, 300.0], dtype=np.float32)
+        self.assertTrue(np.array_equal(perturbed[0, :, 0, 1], expected_rgb))
+        self.assertTrue(np.array_equal(perturbed[0, :, 1, 0], expected_rgb))
+        # Unselected pixels remain exactly unchanged.
+        self.assertTrue(np.array_equal(perturbed[0, :, 0, 0], image[0, :, 0, 0]))
+        self.assertTrue(np.array_equal(perturbed[0, :, 1, 1], image[0, :, 1, 1]))
+
     @patch("app.quantus_metrics.generate_xai_attributions")
     def test_initial_quantus_metric_set_returns_metadata_and_scores(self, mock_attributions) -> None:
         attribution = np.arange(16, dtype=np.float32).reshape(4, 4)
@@ -43,6 +62,11 @@ class QuantusMetricsTests(unittest.TestCase):
         self.assertLessEqual(scores[0].value, 1.0)
         self.assertEqual(scores[0].score_direction, "higher")
         self.assertEqual(scores[0].parameters["attribution"], "normalise_by_max")
+        self.assertEqual(scores[0].parameters["feature_unit"], "spatial_pixel_rgb_group")
+        self.assertEqual(
+            scores[0].parameters["perturbation"],
+            "replace_selected_spatial_pixels_in_all_channels",
+        )
         self.assertEqual(mock_attributions.call_count, 2)
 
     @patch("app.quantus_metrics._load_quantus")
@@ -69,7 +93,7 @@ class QuantusMetricsTests(unittest.TestCase):
         mock_quantus.return_value = FakeQuantus
         scores = evaluate_quantus_metrics(
             model=TinyClassifier(),
-            input_tensor=torch.ones((1, 3, 4, 4)),
+            input_tensor=torch.arange(48, dtype=torch.float32).reshape(1, 3, 4, 4) / 47,
             attribution=np.arange(16, dtype=np.float32).reshape(4, 4),
             target_class=0,
             xai_method="Grad-CAM",

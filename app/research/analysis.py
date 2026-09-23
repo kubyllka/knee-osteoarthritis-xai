@@ -8,7 +8,7 @@ from collections.abc import Iterable
 
 import numpy as np
 import pandas as pd
-from scipy.stats import friedmanchisquare, kruskal, rankdata, wilcoxon
+from scipy.stats import friedmanchisquare, kruskal, mannwhitneyu, rankdata, wilcoxon
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, cohen_kappa_score, f1_score
 
 from app.research.results import validate_research_results
@@ -41,6 +41,8 @@ METHOD_COMPARISON_METRICS = (
     "Sparseness",
 )
 ARCHITECTURE_MODELS = ("densenet121", "resnet50")
+CORRECTNESS_PERMUTATIONS = 10_000
+CORRECTNESS_PERMUTATION_SEED = 42
 
 
 class ResearchAnalysisError(ValueError):
@@ -596,6 +598,190 @@ def architecture_comparison_analysis(pairs: dict[tuple[str, str], pd.DataFrame])
     summary["Metric"] = pd.Categorical(summary["Metric"], METHOD_COMPARISON_METRICS, ordered=True)
     summary["XAI method"] = pd.Categorical(summary["XAI method"], XAI_METHOD_ORDER, ordered=True)
     return summary.sort_values(["Metric", "XAI method"]).reset_index(drop=True)
+
+
+def prediction_correctness_values(results: pd.DataFrame) -> pd.DataFrame:
+    """Return valid metric rows with correctness derived from the KL predictions."""
+    _require_unique_rows(results)
+    _require_prediction_metadata_consistency(results)
+    _require_metric_configuration_consistency(results)
+    status = results.get("metric_status", pd.Series("ok", index=results.index))
+    values = results[status.eq("ok")].copy()
+    values["metric_value"] = pd.to_numeric(values["metric_value"], errors="coerce")
+    values = values[
+        values["metric_value"].notna()
+        & np.isfinite(values["metric_value"])
+        & values["metric_name"].isin(METHOD_COMPARISON_METRICS)
+        & values["xai_method"].isin(XAI_METHOD_ORDER)
+    ].copy()
+    values["is_correct_derived"] = values["predicted_kl"].eq(values["true_kl"])
+    return values[
+        [
+            "model_name", "sample_id", "true_kl", "xai_method", "metric_name",
+            "metric_value", "is_correct_derived",
+        ]
+    ].rename(columns={
+        "model_name": "Model",
+        "xai_method": "XAI method",
+        "metric_name": "Metric",
+        "is_correct_derived": "Correct",
+    })
+
+
+def _pooled_rank_biserial(values: np.ndarray, correct_labels: np.ndarray) -> float:
+    """Mann–Whitney rank-biserial effect where positive means correct values are higher."""
+    correct_n = int(correct_labels.sum())
+    incorrect_n = len(correct_labels) - correct_n
+    if not correct_n or not incorrect_n:
+        return np.nan
+    ranks = rankdata(values)
+    u_correct = float(ranks[correct_labels].sum() - correct_n * (correct_n + 1) / 2)
+    return 2 * u_correct / (correct_n * incorrect_n) - 1
+
+
+def _stable_permutation_seed(model_name: str, method: str, metric_name: str) -> int:
+    """Derive a reproducible child seed without relying on Python's randomized hash."""
+    text = f"{CORRECTNESS_PERMUTATION_SEED}|{model_name}|{method}|{metric_name}"
+    return int.from_bytes(text.encode("utf-8"), "little", signed=False) % (2**32)
+
+
+def _stratified_permuted_correctness_labels(
+    true_kl: np.ndarray,
+    correct_labels: np.ndarray,
+    *,
+    permutations: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Shuffle labels within KL strata while retaining each stratum's correct count."""
+    permuted_labels = np.zeros((permutations, len(correct_labels)), dtype=bool)
+    for grade in np.unique(true_kl):
+        indices = np.flatnonzero(true_kl == grade)
+        correct_in_grade = int(correct_labels[indices].sum())
+        if correct_in_grade == 0:
+            continue
+        if correct_in_grade == len(indices):
+            permuted_labels[:, indices] = True
+            continue
+        random_order = np.argsort(rng.random((permutations, len(indices))), axis=1)
+        chosen = random_order[:, :correct_in_grade]
+        row_indices = np.repeat(np.arange(permutations), correct_in_grade)
+        column_indices = indices[chosen.reshape(-1)]
+        permuted_labels[row_indices, column_indices] = True
+    return permuted_labels
+
+
+def stratified_correctness_permutation_p_value(
+    values: np.ndarray,
+    true_kl: np.ndarray,
+    correct_labels: np.ndarray,
+    *,
+    seed: int,
+    permutations: int = CORRECTNESS_PERMUTATIONS,
+) -> float:
+    """Two-sided, KL-stratified permutation p-value for pooled rank-biserial effect."""
+    if permutations <= 0:
+        raise ValueError("permutations must be positive")
+    observed = _pooled_rank_biserial(values, correct_labels)
+    if not np.isfinite(observed):
+        return np.nan
+
+    ranks = rankdata(values)
+    correct_n = int(correct_labels.sum())
+    baseline = correct_n * (correct_n + 1) / 2
+    denominator = correct_n * (len(correct_labels) - correct_n)
+    rng = np.random.default_rng(seed)
+    permuted_labels = _stratified_permuted_correctness_labels(
+        true_kl, correct_labels, permutations=permutations, rng=rng
+    )
+    u_correct = permuted_labels @ ranks - baseline
+    effects = 2 * u_correct / denominator - 1
+    extreme = int((np.abs(effects) >= abs(observed) - 1e-12).sum())
+    return (extreme + 1) / (permutations + 1)
+
+
+def prediction_correctness_analysis(
+    results: pd.DataFrame,
+    *,
+    permutations: int = CORRECTNESS_PERMUTATIONS,
+) -> pd.DataFrame:
+    """Compare correct and incorrect prediction explanations without mixing methods or metrics."""
+    values = prediction_correctness_values(results)
+    all_rows = results[
+        results["metric_name"].isin(METHOD_COMPARISON_METRICS)
+        & results["xai_method"].isin(XAI_METHOD_ORDER)
+    ]
+    rows = []
+    for model_name in sorted(results["model_name"].unique()):
+        for method in XAI_METHOD_ORDER:
+            for metric_name in METHOD_COMPARISON_METRICS:
+                candidate = all_rows[
+                    all_rows["model_name"].eq(model_name)
+                    & all_rows["xai_method"].eq(method)
+                    & all_rows["metric_name"].eq(metric_name)
+                ]
+                group = values[
+                    values["Model"].eq(model_name)
+                    & values["XAI method"].eq(method)
+                    & values["Metric"].eq(metric_name)
+                ]
+                correct = group[group["Correct"]]
+                incorrect = group[~group["Correct"]]
+                correct_n, incorrect_n = len(correct), len(incorrect)
+                row: dict[str, object] = {
+                    "Model": model_name,
+                    "XAI method": method,
+                    "Metric": metric_name,
+                    "Correct N": correct_n,
+                    "Incorrect N": incorrect_n,
+                    "Excluded N": int(candidate["sample_id"].nunique() - group["sample_id"].nunique()),
+                    "Correct median": correct["metric_value"].median(),
+                    "Correct Q1": correct["metric_value"].quantile(0.25),
+                    "Correct Q3": correct["metric_value"].quantile(0.75),
+                    "Incorrect median": incorrect["metric_value"].median(),
+                    "Incorrect Q1": incorrect["metric_value"].quantile(0.25),
+                    "Incorrect Q3": incorrect["metric_value"].quantile(0.75),
+                    "Mann–Whitney U": np.nan,
+                    "p raw": np.nan,
+                    "Rank-biserial correlation": np.nan,
+                    "KL-adjusted permutation p raw": np.nan,
+                    "Test status": "ok",
+                }
+                if not correct_n or not incorrect_n:
+                    row["Test status"] = "missing correct or incorrect group"
+                else:
+                    statistic, p_value = mannwhitneyu(
+                        correct["metric_value"], incorrect["metric_value"], alternative="two-sided", method="auto"
+                    )
+                    metric_values = group["metric_value"].to_numpy()
+                    labels = group["Correct"].to_numpy(dtype=bool)
+                    row.update({
+                        "Mann–Whitney U": float(statistic),
+                        "p raw": float(p_value),
+                        "Rank-biserial correlation": _pooled_rank_biserial(metric_values, labels),
+                        "KL-adjusted permutation p raw": stratified_correctness_permutation_p_value(
+                            metric_values,
+                            group["true_kl"].to_numpy(),
+                            labels,
+                            seed=_stable_permutation_seed(model_name, method, metric_name),
+                            permutations=permutations,
+                        ),
+                    })
+                rows.append(row)
+
+    summary = pd.DataFrame(rows)
+    summary["p Holm"] = np.nan
+    summary["KL-adjusted permutation p Holm"] = np.nan
+    for _, indices in summary.groupby("Model").groups.items():
+        locations = list(indices)
+        summary.loc[locations, "p Holm"] = holm_adjust(summary.loc[locations, "p raw"])
+        summary.loc[locations, "KL-adjusted permutation p Holm"] = holm_adjust(
+            summary.loc[locations, "KL-adjusted permutation p raw"]
+        )
+    summary["Primary significant"] = summary["p Holm"].lt(0.05)
+    summary["KL-adjusted significant"] = summary["KL-adjusted permutation p Holm"].lt(0.05)
+    summary["Metric"] = pd.Categorical(summary["Metric"], METHOD_COMPARISON_METRICS, ordered=True)
+    summary["XAI method"] = pd.Categorical(summary["XAI method"], XAI_METHOD_ORDER, ordered=True)
+    return summary.sort_values(["Model", "Metric", "XAI method"]).reset_index(drop=True)
 
 
 def dunn_posthoc(results: pd.DataFrame, analysis: pd.DataFrame) -> pd.DataFrame:
