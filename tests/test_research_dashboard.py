@@ -1,9 +1,11 @@
 import unittest
 from unittest.mock import patch
+from pathlib import Path
 
 import pandas as pd
 
 from app.metric_registry import metric_definition
+from app.research.manifest import DatasetSample
 from streamlit_app import (
     _classifier_accuracy_chart_data,
     _correctness_effect_heatmap_data,
@@ -19,16 +21,19 @@ from streamlit_app import (
 from scripts.run_research import (
     RUNNER_METRICS,
     _validate_resume_configuration,
+    combination_seed,
     completed_combinations,
+    completed_combinations_for_metrics,
     ordinal_parity_warning,
     resolve_device,
+    select_manifest_samples,
 )
 
 
 class ResearchDashboardAndRunnerTests(unittest.TestCase):
     def test_dashboard_category_routing_matches_evaluation_dimensions(self) -> None:
         self.assertEqual(metric_definition("FaithfulnessCorrelation").category, "faithfulness")
-        self.assertEqual(metric_definition("Deletion confidence drop").category, "faithfulness")
+        self.assertEqual(metric_definition("Region perturbation score-drop AUC").category, "faithfulness")
         self.assertEqual(metric_definition("MaxSensitivity").category, "robustness")
         self.assertEqual(metric_definition("Stability score").category, "robustness")
         self.assertEqual(metric_definition("Sparseness").category, "complexity")
@@ -36,6 +41,7 @@ class ResearchDashboardAndRunnerTests(unittest.TestCase):
     def test_custom_checks_are_visible_in_their_own_tab(self) -> None:
         self.assertTrue(_is_custom_check("Deletion confidence drop", "custom"))
         self.assertTrue(_is_custom_check("Stability score", "custom"))
+        self.assertFalse(_is_custom_check("Region perturbation score-drop AUC", "quantus"))
         self.assertFalse(_is_custom_check("MaxSensitivity", "quantus"))
 
     def test_completed_combinations_requires_every_metric(self) -> None:
@@ -43,6 +49,34 @@ class ResearchDashboardAndRunnerTests(unittest.TestCase):
         partial = [{"sample_id": "two", "xai_method": "Grad-CAM", "metric_name": "Sparseness"}]
         completed = completed_combinations(pd.DataFrame(full + partial))
         self.assertEqual(completed, {("one", "Grad-CAM")})
+
+    def test_selective_completion_requires_only_requested_metrics(self) -> None:
+        rows = pd.DataFrame([
+            {"sample_id": "one", "xai_method": "Grad-CAM", "metric_name": "FaithfulnessCorrelation"},
+            {"sample_id": "one", "xai_method": "Grad-CAM", "metric_name": "Region perturbation score-drop AUC"},
+        ])
+        completed = completed_combinations_for_metrics(
+            rows,
+            {"FaithfulnessCorrelation", "Region perturbation score-drop AUC"},
+        )
+        self.assertEqual(completed, {("one", "Grad-CAM")})
+
+    def test_combination_seed_is_stable_and_scope_specific(self) -> None:
+        first = combination_seed(42, "resnet50", "sample-1", "Grad-CAM", "MaxSensitivity")
+        self.assertEqual(first, combination_seed(42, "resnet50", "sample-1", "Grad-CAM", "MaxSensitivity"))
+        self.assertNotEqual(first, combination_seed(42, "resnet50", "sample-1", "Grad-CAM", "Sparseness"))
+
+    def test_balanced_manifest_selection_takes_each_kl_grade(self) -> None:
+        samples = [
+            DatasetSample(f"kl{grade}-{index}", Path(f"{grade}-{index}.png"), grade, "test")
+            for grade in range(5)
+            for index in range(3)
+        ]
+        selected = select_manifest_samples(samples, limit=None, samples_per_kl=2)
+        self.assertEqual(len(selected), 10)
+        self.assertEqual({grade: sum(sample.true_kl == grade for sample in selected) for grade in range(5)}, {
+            0: 2, 1: 2, 2: 2, 3: 2, 4: 2,
+        })
 
     def test_cpu_device_is_always_available(self) -> None:
         self.assertEqual(resolve_device("cpu").type, "cpu")
@@ -138,7 +172,7 @@ class ResearchDashboardAndRunnerTests(unittest.TestCase):
             [
                 {
                     "Model": "resnet50",
-                    "Metric": "Deletion confidence drop",
+                    "Metric": "Region perturbation score-drop AUC",
                     "XAI method": "Grad-CAM",
                     "epsilon squared": 0.4,
                     "Kruskal–Wallis H": 10.0,
@@ -155,7 +189,7 @@ class ResearchDashboardAndRunnerTests(unittest.TestCase):
 
         self.assertEqual(len(effect_data), 25)
         selected = effect_data[
-            effect_data["Metric"].eq("Deletion confidence drop")
+            effect_data["Metric"].eq("Region perturbation score-drop AUC")
             & effect_data["XAI method"].eq("Grad-CAM")
         ].iloc[0]
         self.assertEqual(selected["Effect label"], "0.400*")

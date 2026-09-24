@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import random
 import sys
 from datetime import datetime
@@ -13,10 +14,16 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.config import MODEL_CONFIGS
-from app.evaluation import build_deletion_metrics, build_stability_metrics
+from app.evaluation import build_stability_metrics
 from app.metric_registry import metric_definition, parse_parameters, serialise_parameters
 from app.inference import ONNXKneeOsteoarthritisClassifier
-from app.quantus_metrics import QuantusScore, evaluate_quantus_metrics
+from app.quantus_metrics import (
+    REGION_PERTURBATION_PATCH_SIZE,
+    REGION_PERTURBATION_REGIONS,
+    QuantusScore,
+    evaluate_quantus_metrics,
+    random_order_region_control,
+)
 from app.research.manifest import DatasetSample, load_dataset_manifest
 from app.research.results import load_research_results, validate_research_results
 from app.xai import generate_xai_visualization, load_xai_model_by_name, predict_kl_with_xai_model, preprocess_pil_for_torch
@@ -28,12 +35,20 @@ ORDINAL_THRESHOLD_MARGIN = 1e-3
 RUNNER_METRICS = frozenset(
     {
         "FaithfulnessCorrelation",
+        "Region perturbation score-drop AUC",
         "MaxSensitivity",
         "Sparseness",
-        "Deletion confidence drop",
         "Stability score",
     }
 )
+METRIC_KEYS = {
+    "faithfulness-correlation": "FaithfulnessCorrelation",
+    "region-perturbation": "Region perturbation score-drop AUC",
+    "max-sensitivity": "MaxSensitivity",
+    "stability": "Stability score",
+    "sparseness": "Sparseness",
+}
+QUANTUS_METRICS = frozenset(RUNNER_METRICS - {"Stability score"})
 
 
 def ordinal_parity_warning(
@@ -108,6 +123,12 @@ def set_research_seed(seed: int) -> None:
         torch.backends.cudnn.benchmark = False
 
 
+def combination_seed(base_seed: int, *parts: object) -> int:
+    """Create a stable seed independent of run order and resume position."""
+    payload = "|".join([str(base_seed), *(str(part) for part in parts)]).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:4], "big")
+
+
 def prediction_to_dict(prediction) -> dict:
     return {
         "grade": prediction.grade,
@@ -123,6 +144,28 @@ def relative_image_path(sample: DatasetSample) -> str:
         return str(sample.image_path.relative_to(PROJECT_ROOT))
     except ValueError:
         return str(sample.image_path)
+
+
+def select_manifest_samples(
+    samples: list[DatasetSample],
+    limit: int | None,
+    samples_per_kl: int | None,
+) -> list[DatasetSample]:
+    """Select either a leading smoke-test subset or a KL-balanced subset."""
+    if limit is not None and samples_per_kl is not None:
+        raise ValueError("Use either limit or samples_per_kl, not both.")
+    if samples_per_kl is not None:
+        selected = []
+        for grade in range(5):
+            grade_samples = [sample for sample in samples if sample.true_kl == grade]
+            if len(grade_samples) < samples_per_kl:
+                raise ValueError(
+                    f"Manifest has only {len(grade_samples)} KL{grade} samples; "
+                    f"cannot select {samples_per_kl} per KL grade."
+                )
+            selected.extend(grade_samples[:samples_per_kl])
+        return selected
+    return samples[:limit] if limit is not None else samples
 
 
 def metric_row(
@@ -175,21 +218,11 @@ def custom_metric_rows(
     model_name: str,
     xai_result,
     xai_model,
-    classifier: ONNXKneeOsteoarthritisClassifier,
     run_id: str,
     seed: int,
     checkpoint_version: str,
     device_name: str,
 ) -> list[dict]:
-    def predict_fn(image_bytes: bytes, _: str) -> dict:
-        return prediction_to_dict(classifier.predict(image_bytes))
-
-    deletion_table, _ = build_deletion_metrics(
-        [xai_result],
-        prediction,
-        model_name=model_name,
-        predict_fn=predict_fn,
-    )
     stability_table, _ = build_stability_metrics(
         model=xai_model,
         image=xai_result.original,
@@ -198,7 +231,6 @@ def custom_metric_rows(
         model_name=model_name,
     )
 
-    deletion_definition = metric_definition("Deletion confidence drop")
     stability_definition = metric_definition("Stability score")
     ordinal_parameters = (
         {"model_output": "ordinal_class_probability", "xai_target": "predicted_kl_class_score"}
@@ -206,21 +238,6 @@ def custom_metric_rows(
         else {"model_output": "class_probability", "xai_target": "predicted_class_logit"}
     )
     return [
-        metric_row(
-            sample,
-            prediction,
-            model_name,
-            xai_result.method,
-            "Deletion confidence drop",
-            deletion_definition.category,
-            float(deletion_table.iloc[0]["Confidence drop"]),
-            run_id,
-            seed,
-            checkpoint_version,
-            deletion_definition.source,
-            deletion_definition.score_direction,
-            {"masking": "top_20_percent", "replacement": "image_mean", "device": device_name, **ordinal_parameters},
-        ),
         metric_row(
             sample,
             prediction,
@@ -326,10 +343,17 @@ def _validate_resume_configuration(
 
 
 def completed_combinations(rows: pd.DataFrame) -> set[tuple[str, str]]:
-    """Return sample/method pairs which already contain every runner metric."""
+    """Return sample/method pairs which already contain every requested metric."""
+    return completed_combinations_for_metrics(rows, RUNNER_METRICS)
+
+
+def completed_combinations_for_metrics(
+    rows: pd.DataFrame,
+    required_metrics: set[str] | frozenset[str],
+) -> set[tuple[str, str]]:
     completed = set()
     for (sample_id, method), group in rows.groupby(["sample_id", "xai_method"]):
-        if RUNNER_METRICS.issubset(set(group["metric_name"])):
+        if set(required_metrics).issubset(set(group["metric_name"])):
             completed.add((str(sample_id), str(method)))
     return completed
 
@@ -341,6 +365,53 @@ def _write_validated_rows(rows: list[dict], output_path: Path) -> pd.DataFrame:
     return results
 
 
+def _write_random_control_rows(rows: list[dict], output_path: Path) -> pd.DataFrame:
+    frame = pd.DataFrame(rows)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(output_path, index=False)
+    return frame
+
+
+def _validate_random_control_resume(
+    frame: pd.DataFrame,
+    *,
+    model_name: str,
+    checkpoint_version: str,
+    device_name: str,
+    repeats: int,
+    base_seed: int,
+) -> None:
+    required = {
+        "sample_id",
+        "model_name",
+        "checkpoint_version",
+        "device",
+        "repeats",
+        "seed",
+        "patch_size",
+        "regions_evaluation",
+    }
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError("Cannot resume random control; missing columns: " + ", ".join(missing))
+    expected_constants = {
+        "model_name": str(model_name),
+        "checkpoint_version": str(checkpoint_version),
+        "device": str(device_name),
+        "repeats": str(repeats),
+        "patch_size": str(REGION_PERTURBATION_PATCH_SIZE),
+        "regions_evaluation": str(REGION_PERTURBATION_REGIONS),
+    }
+    for column, expected in expected_constants.items():
+        actual = set(frame[column].dropna().astype(str))
+        if actual != {expected}:
+            raise ValueError(f"Cannot resume random control: existing output has a different {column}.")
+    for row in frame.itertuples(index=False):
+        expected_seed = combination_seed(base_seed, model_name, row.sample_id, "random-region-control")
+        if int(row.seed) != expected_seed:
+            raise ValueError("Cannot resume random control: existing output has incompatible seeds.")
+
+
 def run_research(
     manifest_path: Path,
     model_name: str,
@@ -349,17 +420,25 @@ def run_research(
     run_id: str,
     seed: int,
     limit: int | None,
+    samples_per_kl: int | None,
     faithfulness_runs: int,
     max_sensitivity_samples: int,
     device: str = "auto",
     resume: bool = False,
+    metrics: set[str] | frozenset[str] | None = None,
+    random_control_output: Path | None = None,
+    random_control_repeats: int = 1,
 ) -> pd.DataFrame:
     set_research_seed(seed)
     selected_device = resolve_device(device)
     device_name = str(selected_device)
-    samples = load_dataset_manifest(manifest_path)
-    if limit is not None:
-        samples = samples[:limit]
+    selected_metrics = frozenset(metrics or RUNNER_METRICS)
+    unknown_metrics = selected_metrics - RUNNER_METRICS
+    if unknown_metrics:
+        raise ValueError("Unsupported research metrics: " + ", ".join(sorted(unknown_metrics)))
+    if random_control_output is not None and random_control_output.resolve() == output_path.resolve():
+        raise ValueError("The random-control output must be different from the main research output.")
+    samples = select_manifest_samples(load_dataset_manifest(manifest_path), limit, samples_per_kl)
     if not samples:
         raise ValueError("No samples selected for the research run.")
 
@@ -370,6 +449,7 @@ def run_research(
     xai_model = load_xai_model_by_name(model_name, device=selected_device)
     checkpoint_version = model_config["checkpoint_path"].name
     rows: list[dict] = []
+    random_control_rows: list[dict] = []
     if output_path.exists():
         if not resume:
             raise FileExistsError(
@@ -387,8 +467,32 @@ def run_research(
             device_name=device_name,
         )
         rows = existing.to_dict("records")
-    complete_pairs = completed_combinations(pd.DataFrame(rows)) if rows else set()
+    complete_pairs = (
+        completed_combinations_for_metrics(pd.DataFrame(rows), selected_metrics)
+        if rows else set()
+    )
     print(f"XAI device: {device_name}")
+
+    if random_control_output is not None and random_control_output.exists():
+        if not resume:
+            raise FileExistsError(
+                f"Random-control output already exists: {random_control_output}. "
+                "Use --resume or choose a new path."
+            )
+        random_control_frame = pd.read_csv(random_control_output)
+        _validate_random_control_resume(
+            random_control_frame,
+            model_name=model_name,
+            checkpoint_version=checkpoint_version,
+            device_name=device_name,
+            repeats=random_control_repeats,
+            base_seed=seed,
+        )
+        random_control_rows = random_control_frame.to_dict("records")
+    completed_control_samples = {
+        str(row["sample_id"]) for row in random_control_rows
+        if str(row.get("model_name")) == model_name
+    }
 
     for sample_index, sample in enumerate(samples, start=1):
         image_bytes = sample.image_path.read_bytes()
@@ -424,6 +528,35 @@ def run_research(
             f"true KL{sample.true_kl}, predicted KL{prediction['grade']}"
         )
 
+        if random_control_output is not None and sample.sample_id not in completed_control_samples:
+            control_seed = combination_seed(seed, model_name, sample.sample_id, "random-region-control")
+            control_mean, control_std, control_values = random_order_region_control(
+                model=xai_model,
+                input_tensor=input_tensor,
+                target_class=int(prediction["grade"]),
+                repeats=random_control_repeats,
+                seed=control_seed,
+            )
+            random_control_rows.append({
+                "sample_id": sample.sample_id,
+                "image_path": relative_image_path(sample),
+                "true_kl": sample.true_kl,
+                "predicted_kl": int(prediction["grade"]),
+                "model_name": model_name,
+                "target_class": int(prediction["grade"]),
+                "random_order_auc_mean": control_mean,
+                "random_order_auc_std": control_std,
+                "random_order_auc_values": serialise_parameters({"values": control_values}),
+                "repeats": random_control_repeats,
+                "seed": control_seed,
+                "patch_size": REGION_PERTURBATION_PATCH_SIZE,
+                "regions_evaluation": REGION_PERTURBATION_REGIONS,
+                "checkpoint_version": checkpoint_version,
+                "device": device_name,
+            })
+            _write_random_control_rows(random_control_rows, random_control_output)
+            completed_control_samples.add(sample.sample_id)
+
         for method in methods:
             pair = (sample.sample_id, method)
             if pair in complete_pairs:
@@ -433,8 +566,13 @@ def run_research(
             # Replace that incomplete set rather than introducing duplicates.
             rows = [
                 row for row in rows
-                if not (str(row["sample_id"]) == sample.sample_id and str(row["xai_method"]) == method)
+                if not (
+                    str(row["sample_id"]) == sample.sample_id
+                    and str(row["xai_method"]) == method
+                    and str(row["metric_name"]) in selected_metrics
+                )
             ]
+            set_research_seed(combination_seed(seed, model_name, sample.sample_id, method, "attribution"))
             xai_result = generate_xai_visualization(
                 model=xai_model,
                 image=image,
@@ -442,43 +580,54 @@ def run_research(
                 class_idx=int(prediction["grade"]),
                 model_name=model_name,
             )
-            quantus_scores = evaluate_quantus_metrics(
-                model=xai_model,
-                input_tensor=input_tensor,
-                attribution=xai_result.raw_attribution,
-                target_class=xai_result.class_idx,
-                xai_method=method,
-                model_name=model_name,
-                faithfulness_runs=faithfulness_runs,
-                max_sensitivity_samples=max_sensitivity_samples,
-            )
-            rows.extend(
-                quantus_metric_rows(
-                    sample,
-                    prediction,
-                    model_name,
-                    method,
-                    quantus_scores,
-                    run_id,
-                    seed,
-                    checkpoint_version,
-                    device_name,
+            selected_quantus_metrics = set(selected_metrics & QUANTUS_METRICS)
+            if selected_quantus_metrics:
+                quantus_scores = []
+                for metric_name in sorted(selected_quantus_metrics):
+                    set_research_seed(
+                        combination_seed(seed, model_name, sample.sample_id, method, metric_name)
+                    )
+                    quantus_scores.extend(
+                        evaluate_quantus_metrics(
+                            model=xai_model,
+                            input_tensor=input_tensor,
+                            attribution=xai_result.raw_attribution,
+                            target_class=xai_result.class_idx,
+                            xai_method=method,
+                            model_name=model_name,
+                            faithfulness_runs=faithfulness_runs,
+                            max_sensitivity_samples=max_sensitivity_samples,
+                            requested_metrics={metric_name},
+                        )
+                    )
+                rows.extend(
+                    quantus_metric_rows(
+                        sample,
+                        prediction,
+                        model_name,
+                        method,
+                        quantus_scores,
+                        run_id,
+                        seed,
+                        checkpoint_version,
+                        device_name,
+                    )
                 )
-            )
-            rows.extend(
-                custom_metric_rows(
-                    sample,
-                    prediction,
-                    model_name,
-                    xai_result,
-                    xai_model,
-                    classifier,
-                    run_id,
-                    seed,
-                    checkpoint_version,
-                    device_name,
+            if "Stability score" in selected_metrics:
+                set_research_seed(combination_seed(seed, model_name, sample.sample_id, method, "stability"))
+                rows.extend(
+                    custom_metric_rows(
+                        sample,
+                        prediction,
+                        model_name,
+                        xai_result,
+                        xai_model,
+                        run_id,
+                        seed,
+                        checkpoint_version,
+                        device_name,
+                    )
                 )
-            )
             _write_validated_rows(rows, output_path)
             complete_pairs.add(pair)
 
@@ -494,16 +643,37 @@ def parse_args():
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--samples-per-kl", type=int, default=None)
     parser.add_argument("--faithfulness-runs", type=int, default=50)
     parser.add_argument("--max-sensitivity-samples", type=int, default=8)
+    parser.add_argument(
+        "--metrics",
+        nargs="+",
+        choices=sorted(METRIC_KEYS),
+        default=list(METRIC_KEYS),
+        help="Metrics to calculate. Use metric keys such as faithfulness-correlation or region-perturbation.",
+    )
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--resume", action="store_true", help="Continue a matching partially completed output CSV.")
+    parser.add_argument(
+        "--random-control-output",
+        type=Path,
+        default=None,
+        help="Optional separate CSV for the method-independent random region-order sanity control.",
+    )
+    parser.add_argument("--random-control-repeats", type=int, default=1)
     args = parser.parse_args()
 
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
+    if args.samples_per_kl is not None and args.samples_per_kl <= 0:
+        parser.error("--samples-per-kl must be positive")
+    if args.limit is not None and args.samples_per_kl is not None:
+        parser.error("Use either --limit or --samples-per-kl, not both")
     if args.faithfulness_runs <= 0 or args.max_sensitivity_samples <= 0:
         parser.error("Quantus sample counts must be positive")
+    if args.random_control_repeats <= 0:
+        parser.error("--random-control-repeats must be positive")
 
     if args.run_id is None:
         args.run_id = datetime.now().strftime("research-%Y%m%d-%H%M%S")
@@ -522,9 +692,13 @@ if __name__ == "__main__":
         run_id=arguments.run_id,
         seed=arguments.seed,
         limit=arguments.limit,
+        samples_per_kl=arguments.samples_per_kl,
         faithfulness_runs=arguments.faithfulness_runs,
         max_sensitivity_samples=arguments.max_sensitivity_samples,
         device=arguments.device,
         resume=arguments.resume,
+        metrics={METRIC_KEYS[key] for key in arguments.metrics},
+        random_control_output=arguments.random_control_output,
+        random_control_repeats=arguments.random_control_repeats,
     )
     print(f"Saved {len(dataframe)} metric rows to: {arguments.output}")

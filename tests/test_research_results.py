@@ -84,6 +84,18 @@ class ResearchResultsTests(unittest.TestCase):
         self.assertTrue(pd.isna(loaded.loc[0, "metric_value"]))
         self.assertEqual(loaded.loc[0, "metric_status"], "undefined_zero_perturbed_attribution")
 
+    def test_degenerate_correlation_is_a_transparent_undefined_metric(self) -> None:
+        undefined = valid_results()
+        undefined.loc[0, "metric_name"] = "FaithfulnessCorrelation"
+        undefined.loc[0, "metric_value"] = None
+        undefined.loc[0, "metric_status"] = "undefined_degenerate_correlation"
+        undefined.loc[0, "metric_note"] = "Perturbation results had zero variance."
+
+        loaded = validate_research_results(undefined)
+
+        self.assertTrue(pd.isna(loaded.loc[0, "metric_value"]))
+        self.assertEqual(loaded.loc[0, "metric_status"], "undefined_degenerate_correlation")
+
     def test_undefined_metric_requires_an_empty_value_and_note(self) -> None:
         invalid = valid_results()
         invalid.loc[0, "metric_status"] = "undefined_zero_perturbed_attribution"

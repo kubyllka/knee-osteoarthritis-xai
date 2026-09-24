@@ -4,7 +4,13 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from app.quantus_metrics import evaluate_quantus_metrics, perturb_spatial_pixels_all_channels
+from app.quantus_metrics import (
+    evaluate_quantus_metrics,
+    normalised_score_drop_auc,
+    perturb_spatial_pixels_all_channels,
+    random_order_region_control,
+    replace_region_with_channel_means,
+)
 
 
 class TinyClassifier(torch.nn.Module):
@@ -33,6 +39,37 @@ class QuantusMetricsTests(unittest.TestCase):
         self.assertTrue(np.array_equal(perturbed[0, :, 0, 0], image[0, :, 0, 0]))
         self.assertTrue(np.array_equal(perturbed[0, :, 1, 1], image[0, :, 1, 1]))
 
+    def test_region_perturbation_replaces_same_patch_in_all_channels(self) -> None:
+        image = np.arange(12, dtype=np.float32).reshape(1, -1)
+        # Spatial position 1 in each 2x2 channel plane.
+        indices = np.array([[1, 5, 9]])
+        perturbed = replace_region_with_channel_means(
+            image,
+            indices,
+            channel_means=np.array([[100.0, 200.0, 300.0]], dtype=np.float32),
+            spatial_plane_size=4,
+        )
+
+        self.assertEqual(perturbed[0, 1], 100.0)
+        self.assertEqual(perturbed[0, 5], 200.0)
+        self.assertEqual(perturbed[0, 9], 300.0)
+        self.assertTrue(np.array_equal(perturbed[0, [0, 2, 4, 6, 8, 10]], image[0, [0, 2, 4, 6, 8, 10]]))
+
+    def test_region_perturbation_auc_has_zero_origin_and_normalised_axis(self) -> None:
+        self.assertAlmostEqual(normalised_score_drop_auc(np.array([1.0, 3.0])), 1.25)
+
+    @patch("app.quantus_metrics.region_perturbation_score_drop_auc")
+    @patch("app.quantus_metrics._load_quantus", return_value=object())
+    def test_random_order_control_is_fixed_seed_reproducible(self, _load, mock_region) -> None:
+        mock_region.side_effect = lambda **_: float(np.random.random())
+        inputs = torch.zeros((1, 3, 2, 2), dtype=torch.float32)
+
+        first = random_order_region_control(TinyClassifier(), inputs, target_class=0, repeats=3, seed=42)
+        second = random_order_region_control(TinyClassifier(), inputs, target_class=0, repeats=3, seed=42)
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(first[2]), 3)
+
     @patch("app.quantus_metrics.generate_xai_attributions")
     def test_initial_quantus_metric_set_returns_metadata_and_scores(self, mock_attributions) -> None:
         attribution = np.arange(16, dtype=np.float32).reshape(4, 4)
@@ -56,7 +93,10 @@ class QuantusMetricsTests(unittest.TestCase):
                 self.skipTest(str(exc))
             raise
 
-        self.assertEqual([score.metric_name for score in scores], ["FaithfulnessCorrelation", "MaxSensitivity", "Sparseness"])
+        self.assertEqual(
+            [score.metric_name for score in scores],
+            ["FaithfulnessCorrelation", "Region perturbation score-drop AUC", "MaxSensitivity", "Sparseness"],
+        )
         self.assertTrue(all(np.isfinite(score.value) for score in scores))
         self.assertGreaterEqual(scores[0].value, -1.0)
         self.assertLessEqual(scores[0].value, 1.0)
@@ -68,6 +108,10 @@ class QuantusMetricsTests(unittest.TestCase):
             "replace_selected_spatial_pixels_in_all_channels",
         )
         self.assertEqual(mock_attributions.call_count, 2)
+        region = scores[1]
+        self.assertEqual(region.parameters["patch_size"], 16)
+        self.assertEqual(region.parameters["order"], "morf")
+        self.assertFalse(region.parameters["softmax"])
 
     @patch("app.quantus_metrics._load_quantus")
     def test_zero_perturbed_map_marks_only_max_sensitivity_undefined(self, mock_quantus) -> None:
@@ -100,6 +144,7 @@ class QuantusMetricsTests(unittest.TestCase):
             model_name="resnet50",
             faithfulness_runs=2,
             max_sensitivity_samples=2,
+            requested_metrics={"FaithfulnessCorrelation", "MaxSensitivity", "Sparseness"},
         )
 
         self.assertEqual([score.status for score in scores], ["ok", "undefined_zero_perturbed_attribution", "ok"])

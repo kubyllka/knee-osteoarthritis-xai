@@ -67,7 +67,7 @@ QUICK_MAX_SENSITIVITY_SAMPLES = 2
 # deliberately do not imply that one metric or method is an overall winner.
 PRIMARY_KL_METRIC_ORDER = [
     "FaithfulnessCorrelation",
-    "Deletion confidence drop",
+    "Region perturbation score-drop AUC",
     "MaxSensitivity",
     "Stability score",
     "Sparseness",
@@ -638,7 +638,7 @@ def _method_metric_caption(metric_name: str) -> str:
         return "Metric metadata are unavailable."
     if metric_name == "Sparseness":
         return f"{definition.description} Concentration only: higher values are not automatically better."
-    if metric_name == "Deletion confidence drop":
+    if metric_name == "Region perturbation score-drop AUC":
         return f"{definition.description} Higher is a stronger supporting faithfulness signal, but it is influenced partly by original model confidence."
     if metric_name == "MaxSensitivity":
         return f"{definition.description} Lower values are better. The Y-axis is logarithmic to retain the full positive range, including large outliers."
@@ -858,8 +858,8 @@ def _show_results_analysis(results: pd.DataFrame) -> None:
     st.caption(
         "ε² describes the strength of association between true KL stage and this specific metric; it is not an "
         "XAI-method quality score or leaderboard. A result that is significant for one architecture and not the other "
-        "does not by itself establish an architecture difference. Sparseness describes concentration, while deletion is "
-        "a supporting faithfulness check influenced partly by the original model confidence."
+        "does not by itself establish an architecture difference. Sparseness describes concentration, while region "
+        "perturbation is a configuration-dependent supporting faithfulness check."
     )
 
     st.markdown("#### XAI-method comparison")
@@ -1237,8 +1237,8 @@ def show_research_mode() -> None:
                     continue
                 if category == "custom":
                     st.caption(
-                        "Supporting project-specific checks. Deletion is also shown under Faithfulness "
-                        "and stability under Robustness, where their values are interpreted."
+                        "Supporting project-specific checks. Legacy deletion rows and stability appear here; "
+                        "new research runs use Quantus Region Perturbation under Faithfulness."
                     )
                 metrics = sorted(category_rows["metric_name"].unique())
                 selected_metric = metrics[0] if len(metrics) == 1 else st.selectbox("Metric", metrics, key=f"research-metric-{category}")

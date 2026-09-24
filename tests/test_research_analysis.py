@@ -26,7 +26,7 @@ from app.research.analysis import (
 )
 
 
-def make_rows(method: str = "Grad-CAM", metric: str = "Deletion confidence drop") -> pd.DataFrame:
+def make_rows(method: str = "Grad-CAM", metric: str = "Region perturbation score-drop AUC") -> pd.DataFrame:
     rows = []
     for grade in range(5):
         for index in range(2):
@@ -60,7 +60,7 @@ def make_rows(method: str = "Grad-CAM", metric: str = "Deletion confidence drop"
 
 
 def make_paired_rows(
-    model_name: str = "model-a", metric: str = "Deletion confidence drop", identical_first_pair: bool = False
+    model_name: str = "model-a", metric: str = "Region perturbation score-drop AUC", identical_first_pair: bool = False
 ) -> pd.DataFrame:
     methods = ["Grad-CAM", "Grad-CAM++", "Eigen-CAM", "Integrated Gradients", "SmoothGrad"]
     frames = []
@@ -75,7 +75,7 @@ def make_paired_rows(
     return pd.concat(frames, ignore_index=True)
 
 
-def make_architecture_rows(metric: str = "Deletion confidence drop") -> pd.DataFrame:
+def make_architecture_rows(metric: str = "Region perturbation score-drop AUC") -> pd.DataFrame:
     dense = make_paired_rows(model_name="densenet121", metric=metric)
     resnet = make_paired_rows(model_name="resnet50", metric=metric)
     resnet["metric_value"] = resnet["metric_value"] - 0.02
@@ -157,7 +157,7 @@ class ResearchAnalysisTests(unittest.TestCase):
         ]
 
         matrices = method_complete_case_matrices(merge_research_results([rows]))
-        matrix = matrices[("model-a", "Deletion confidence drop")]
+        matrix = matrices[("model-a", "Region perturbation score-drop AUC")]
         descriptives = method_comparison_descriptives(matrices)
 
         self.assertEqual(len(matrix), 9)
@@ -172,7 +172,7 @@ class ResearchAnalysisTests(unittest.TestCase):
         )
         matrices = method_complete_case_matrices(merge_research_results([rows]))
         summary = friedman_method_analysis(matrices)
-        deletion = summary[summary["Metric"].eq("Deletion confidence drop")].iloc[0]
+        deletion = summary[summary["Metric"].eq("Region perturbation score-drop AUC")].iloc[0]
 
         expected_w = deletion["Friedman statistic"] / (deletion["Valid N"] * 4)
         self.assertAlmostEqual(deletion["Kendall's W"], expected_w)
@@ -189,7 +189,7 @@ class ResearchAnalysisTests(unittest.TestCase):
         rows = pd.concat([significant_rows, nonsignificant_rows], ignore_index=True)
         matrices = method_complete_case_matrices(merge_research_results([rows]))
         summary = friedman_method_analysis(matrices)
-        summary.loc[summary["Metric"].eq("Deletion confidence drop"), "Friedman significant"] = True
+        summary.loc[summary["Metric"].eq("Region perturbation score-drop AUC"), "Friedman significant"] = True
         summary.loc[summary["Metric"].eq("Sparseness"), "Friedman significant"] = False
 
         posthoc = wilcoxon_method_posthoc(matrices, summary)
@@ -213,11 +213,11 @@ class ResearchAnalysisTests(unittest.TestCase):
         ]
 
         pairs = architecture_complete_case_pairs(merge_research_results([rows]))
-        matrix = pairs[("Grad-CAM", "Deletion confidence drop")]
+        matrix = pairs[("Grad-CAM", "Region perturbation score-drop AUC")]
         summary = architecture_comparison_analysis(pairs)
         result = summary[
             summary["XAI method"].eq("Grad-CAM")
-            & summary["Metric"].eq("Deletion confidence drop")
+            & summary["Metric"].eq("Region perturbation score-drop AUC")
         ].iloc[0]
 
         self.assertEqual(tuple(matrix.columns), ARCHITECTURE_MODELS)
@@ -235,7 +235,7 @@ class ResearchAnalysisTests(unittest.TestCase):
         rows.loc[mismatch, ["predicted_kl", "target_class", "is_correct", "error_distance"]] = [2, 2, False, 1]
 
         pairs = architecture_complete_case_pairs(merge_research_results([rows]), same_target_only=True)
-        matrix = pairs[("Grad-CAM", "Deletion confidence drop")]
+        matrix = pairs[("Grad-CAM", "Region perturbation score-drop AUC")]
 
         self.assertEqual(matrix.attrs["candidate_n"], 9)
         self.assertEqual(len(matrix), 9)
@@ -258,7 +258,7 @@ class ResearchAnalysisTests(unittest.TestCase):
         rows = make_correctness_rows()
         undefined = rows.index[
             (rows["xai_method"] == "Grad-CAM")
-            & (rows["metric_name"] == "Deletion confidence drop")
+            & (rows["metric_name"] == "Region perturbation score-drop AUC")
             & (rows["sample_id"] == "kl2-1")
         ][0]
         rows.loc[undefined, ["metric_value", "metric_status", "metric_note"]] = [
@@ -271,10 +271,10 @@ class ResearchAnalysisTests(unittest.TestCase):
         summary = prediction_correctness_analysis(results, permutations=50)
         result = summary[
             summary["XAI method"].eq("Grad-CAM")
-            & summary["Metric"].eq("Deletion confidence drop")
+            & summary["Metric"].eq("Region perturbation score-drop AUC")
         ].iloc[0]
 
-        self.assertEqual(len(values[values["Metric"].eq("Deletion confidence drop")]), 49)
+        self.assertEqual(len(values[values["Metric"].eq("Region perturbation score-drop AUC")]), 49)
         self.assertEqual(int(result["Correct N"]) + int(result["Incorrect N"]), 9)
         self.assertEqual(int(result["Excluded N"]), 1)
         self.assertGreater(result["Correct median"], result["Incorrect median"])

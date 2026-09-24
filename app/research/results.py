@@ -36,7 +36,11 @@ OPTIONAL_COLUMNS = (
 VALID_METRIC_CATEGORIES = frozenset(
     {"faithfulness", "robustness", "complexity", "randomisation", "custom"}
 )
-VALID_METRIC_STATUSES = frozenset({"ok", "undefined_zero_perturbed_attribution"})
+VALID_METRIC_STATUSES = frozenset({
+    "ok",
+    "undefined_zero_perturbed_attribution",
+    "undefined_degenerate_correlation",
+})
 
 
 class ResearchResultsValidationError(ValueError):
@@ -127,7 +131,7 @@ def validate_research_results(results: pd.DataFrame) -> pd.DataFrame:
     raw_metric_values = cleaned["metric_value"]
     metric_values = pd.to_numeric(raw_metric_values, errors="coerce")
     value_is_finite = metric_values.notna() & np.isfinite(metric_values)
-    undefined = cleaned["metric_status"].eq("undefined_zero_perturbed_attribution")
+    undefined = cleaned["metric_status"].ne("ok")
     value_is_empty = raw_metric_values.isna() | raw_metric_values.astype(str).str.strip().eq("")
     if (~undefined & ~value_is_finite).any() or (undefined & ~value_is_empty).any():
         raise ResearchResultsValidationError(

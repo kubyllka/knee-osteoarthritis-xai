@@ -13,7 +13,7 @@ Research Mode reads one or more precomputed experiment CSV files. Its Results an
 - KL grade prediction with probability distribution and confidence;
 - interactive XAI heatmaps and overlays for five explanation methods;
 - deletion and stability checks for a single prediction;
-- optional Quantus metrics: FaithfulnessCorrelation, MaxSensitivity, and Sparseness;
+- optional Quantus metrics: FaithfulnessCorrelation, Region Perturbation score-drop AUC, MaxSensitivity, and Sparseness;
 - Research Mode for filtering and comparing precomputed experiment results by model, XAI method, true KL grade, and prediction correctness.
 
 ## Application modes
@@ -59,6 +59,18 @@ Place images listed in `inputs/manifest.json` locally, ensure the corresponding 
 
 The runner writes a validated partial CSV to `results/research/` after each completed image/method pair. Use `--device auto` to select CUDA when available, or `--device cuda` to require it; continue a matching interrupted run with `--resume`. CUDA setup is documented separately in [`requirements-gpu.md`](requirements-gpu.md). The small one-image / one-perturbation command is a pipeline check only; it is not sufficient for scientific conclusions.
 
+New runs calculate five metric-specific results: FaithfulnessCorrelation, Region Perturbation score-drop AUC, MaxSensitivity, Stability score, and Sparseness. To recalculate only the two revised faithfulness metrics, use:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_research.py --model resnet50 --methods "Grad-CAM" "Grad-CAM++" "Eigen-CAM" "SmoothGrad" "Integrated Gradients" --metrics faithfulness-correlation region-perturbation
+```
+
+An optional method-independent random-order sanity baseline is written to a separate file and is never included in the main metric statistics:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_research.py --model resnet50 --methods "Grad-CAM" "Grad-CAM++" "Eigen-CAM" "SmoothGrad" "Integrated Gradients" --metrics region-perturbation --samples-per-kl 2 --random-control-output results/research/resnet50-random-control.csv --random-control-repeats 10
+```
+
 The final ordinal checkpoints expected by the application are:
 
 ```text
@@ -80,6 +92,6 @@ Only export checkpoints you trust: older PyTorch checkpoints can contain trainin
 
 ## Notes on XAI evaluation
 
-Metric values should be compared only within the same model, dataset split, XAI configuration, and Quantus configuration. New runs use the bounded, higher-is-better `FaithfulnessCorrelation` metric for faithfulness; old Infidelity rows are legacy data and are not comparable to new runs. No individual metric alone establishes explanation quality.
+Metric values should be compared only within the same model, dataset split, XAI configuration, and Quantus configuration. New runs use spatial RGB-grouped `FaithfulnessCorrelation` and Quantus `Region perturbation score-drop AUC`; old Infidelity and custom Deletion confidence drop rows are legacy data and are not comparable to the revised runs. No individual metric alone establishes explanation quality.
 
 > This project is intended for educational and research purposes only. It is not a clinical diagnostic tool.

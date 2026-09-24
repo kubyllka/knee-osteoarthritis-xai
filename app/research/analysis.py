@@ -35,7 +35,7 @@ XAI_METHOD_ORDER = (
 )
 METHOD_COMPARISON_METRICS = (
     "FaithfulnessCorrelation",
-    "Deletion confidence drop",
+    "Region perturbation score-drop AUC",
     "MaxSensitivity",
     "Stability score",
     "Sparseness",

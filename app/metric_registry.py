@@ -56,6 +56,14 @@ METRIC_REGISTRY: dict[str, MetricDefinition] = {
         display_format="{:.4f}",
         source="custom",
     ),
+    "Region perturbation score-drop AUC": MetricDefinition(
+        category="faithfulness",
+        score_direction="higher",
+        description="Area under the target-score-drop curve when the most relevant image regions are perturbed first.",
+        interpretation="Higher values indicate a stronger response to removing highly attributed regions under the fixed perturbation configuration.",
+        display_format="{:.4f}",
+        source="quantus",
+    ),
     "Stability score": MetricDefinition(
         category="robustness",
         score_direction="higher",
@@ -67,7 +75,7 @@ METRIC_REGISTRY: dict[str, MetricDefinition] = {
 }
 
 
-LEGACY_METRICS = frozenset({"Infidelity"})
+LEGACY_METRICS = frozenset({"Infidelity", "Deletion confidence drop"})
 
 
 def metric_definition(metric_name: str) -> MetricDefinition | None:

@@ -27,6 +27,8 @@ class QuantusScore:
 
 
 QUANTUS_METRIC_METADATA = METRIC_REGISTRY
+REGION_PERTURBATION_PATCH_SIZE = 16
+REGION_PERTURBATION_REGIONS = 100
 
 
 def _load_quantus():
@@ -99,6 +101,119 @@ def perturb_spatial_pixels_all_channels(
     return perturbed
 
 
+def replace_region_with_channel_means(
+    arr: np.ndarray,
+    indices: np.ndarray,
+    channel_means: np.ndarray,
+    spatial_plane_size: int,
+    **_: object,
+) -> np.ndarray:
+    """Replace a flattened spatial patch with fixed per-channel means."""
+    values = np.asarray(arr)
+    selected = np.asarray(indices, dtype=np.int64)
+    means = np.asarray(channel_means)
+    if values.ndim != 2 or selected.ndim != 2 or selected.shape[0] != values.shape[0]:
+        raise ValueError("Region perturbation expects batched flattened arrays and indices.")
+    if means.ndim != 2 or means.shape[0] != values.shape[0]:
+        raise ValueError("channel_means must have shape (batch, channels).")
+    if spatial_plane_size <= 0:
+        raise ValueError("spatial_plane_size must be positive.")
+
+    perturbed = values.copy()
+    for sample_index, sample_indices in enumerate(selected):
+        channels = (sample_indices // spatial_plane_size) % means.shape[1]
+        perturbed[sample_index, sample_indices] = means[sample_index, channels]
+    return perturbed
+
+
+def normalised_score_drop_auc(score_drops: np.ndarray) -> float:
+    """Summarise a score-drop curve on a normalised 0-1 perturbation-step axis."""
+    curve = np.asarray(score_drops, dtype=np.float64).reshape(-1)
+    if curve.size == 0 or not np.isfinite(curve).all():
+        raise ValueError("Region perturbation must return a finite, non-empty curve.")
+    curve_with_origin = np.concatenate(([0.0], curve))
+    fractions = np.linspace(0.0, 1.0, curve_with_origin.size)
+    trapezoid = getattr(np, "trapezoid", np.trapz)
+    return float(trapezoid(curve_with_origin, fractions))
+
+
+def region_perturbation_score_drop_auc(
+    quantus,
+    model: torch.nn.Module,
+    x_batch: np.ndarray,
+    y_batch: np.ndarray,
+    a_batch: np.ndarray,
+    device: str,
+    order: str = "morf",
+    patch_size: int = REGION_PERTURBATION_PATCH_SIZE,
+    regions_evaluation: int = REGION_PERTURBATION_REGIONS,
+) -> float:
+    """Run Quantus RegionPerturbation and calculate target-score-drop AUC."""
+    height, width = x_batch.shape[-2:]
+    padded_height = int(np.ceil(height / patch_size) * patch_size)
+    padded_width = int(np.ceil(width / patch_size) * patch_size)
+    curve = quantus.RegionPerturbation(
+        patch_size=patch_size,
+        order=order,
+        regions_evaluation=regions_evaluation,
+        abs=False,
+        normalise=True,
+        perturb_func=replace_region_with_channel_means,
+        perturb_func_kwargs={
+            "channel_means": x_batch.mean(axis=(2, 3)),
+            "spatial_plane_size": padded_height * padded_width,
+        },
+        disable_warnings=True,
+    )(
+        model=model,
+        x_batch=x_batch,
+        y_batch=y_batch,
+        a_batch=a_batch,
+        channel_first=True,
+        softmax=False,
+        device=device,
+    )
+    return normalised_score_drop_auc(np.asarray(curve, dtype=float))
+
+
+def random_order_region_control(
+    model: torch.nn.Module,
+    input_tensor: torch.Tensor,
+    target_class: int,
+    repeats: int,
+    seed: int,
+) -> tuple[float, float, list[float]]:
+    """Evaluate a method-independent random region-order sanity baseline."""
+    if repeats <= 0:
+        raise ValueError("Random-order control repeats must be positive.")
+    quantus = _load_quantus()
+    x_batch = input_tensor.detach().cpu().numpy().astype(np.float32)
+    y_batch = np.asarray([target_class], dtype=np.int64)
+    neutral_attribution = np.ones(
+        (1, 1, input_tensor.shape[-2], input_tensor.shape[-1]),
+        dtype=np.float32,
+    )
+    values = []
+    for repeat_index in range(repeats):
+        repeat_seed = int(seed + repeat_index)
+        np.random.seed(repeat_seed)
+        torch.manual_seed(repeat_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(repeat_seed)
+        values.append(
+            region_perturbation_score_drop_auc(
+                quantus=quantus,
+                model=model,
+                x_batch=x_batch,
+                y_batch=y_batch,
+                a_batch=neutral_attribution,
+                device=str(_model_device(model)),
+                order="random",
+            )
+        )
+    return float(np.mean(values)), float(np.std(values, ddof=1) if repeats > 1 else 0.0), values
+
+
 def spatial_faithfulness_correlation(
     model: torch.nn.Module,
     input_tensor: torch.Tensor,
@@ -159,6 +274,7 @@ def evaluate_quantus_metrics(
     model_name: str,
     faithfulness_runs: int = 50,
     max_sensitivity_samples: int = 8,
+    requested_metrics: set[str] | frozenset[str] | None = None,
 ) -> list[QuantusScore]:
     """Evaluate one XAI map with the initial Quantus metric set."""
     if input_tensor.shape[0] != 1:
@@ -186,11 +302,27 @@ def evaluate_quantus_metrics(
             model_name=model_name,
         )
 
+    requested = set(requested_metrics or {
+        "FaithfulnessCorrelation",
+        "Region perturbation score-drop AUC",
+        "MaxSensitivity",
+        "Sparseness",
+    })
+    supported = {
+        "FaithfulnessCorrelation",
+        "Region perturbation score-drop AUC",
+        "MaxSensitivity",
+        "Sparseness",
+    }
+    unknown = requested - supported
+    if unknown:
+        raise ValueError("Unsupported Quantus metrics: " + ", ".join(sorted(unknown)))
+
     metric_scores: dict[str, object] = {}
     metric_statuses: dict[str, str] = {}
     metric_notes: dict[str, str] = {}
-    metric_scores["FaithfulnessCorrelation"] = [
-        spatial_faithfulness_correlation(
+    if "FaithfulnessCorrelation" in requested:
+        correlation = spatial_faithfulness_correlation(
             model=model,
             input_tensor=input_tensor,
             attribution=attribution,
@@ -198,36 +330,51 @@ def evaluate_quantus_metrics(
             nr_runs=faithfulness_runs,
             subset_size=subset_size,
         )
-    ]
-    try:
-        metric_scores["MaxSensitivity"] = quantus.MaxSensitivity(
-            nr_samples=max_sensitivity_samples,
-            lower_bound=0.05,
-            disable_warnings=True,
-        )(
-            model=model,
-            x_batch=x_batch,
-            y_batch=y_batch,
-            a_batch=a_batch,
-            channel_first=True,
-            explain_func=explain_func,
-            device=device,
-        )
-    except AssertionError as exc:
-        if "attribution vector are all equal to zero" not in str(exc):
-            raise
-        # A zero map after a MaxSensitivity perturbation is a legitimate
-        # degenerate explanation, but Quantus deliberately refuses to score it.
-        # Record it transparently rather than injecting an epsilon or losing the
-        # entire sample × method result.
-        metric_scores["MaxSensitivity"] = [float("nan")]
-        metric_statuses["MaxSensitivity"] = "undefined_zero_perturbed_attribution"
-        metric_notes["MaxSensitivity"] = (
-            "Quantus could not evaluate MaxSensitivity because at least one "
-            "perturbed input produced an all-zero attribution map."
-        )
+        metric_scores["FaithfulnessCorrelation"] = [correlation]
+        if not np.isfinite(correlation):
+            metric_statuses["FaithfulnessCorrelation"] = "undefined_degenerate_correlation"
+            metric_notes["FaithfulnessCorrelation"] = (
+                "FaithfulnessCorrelation is undefined because the attribution sums or "
+                "target-score changes had zero variance across perturbation runs."
+            )
+    if "Region perturbation score-drop AUC" in requested:
+        metric_scores["Region perturbation score-drop AUC"] = [
+            region_perturbation_score_drop_auc(
+                quantus=quantus,
+                model=model,
+                x_batch=x_batch,
+                y_batch=y_batch,
+                a_batch=a_batch,
+                device=device,
+            )
+        ]
+    if "MaxSensitivity" in requested:
+        try:
+            metric_scores["MaxSensitivity"] = quantus.MaxSensitivity(
+                nr_samples=max_sensitivity_samples,
+                lower_bound=0.05,
+                disable_warnings=True,
+            )(
+                model=model,
+                x_batch=x_batch,
+                y_batch=y_batch,
+                a_batch=a_batch,
+                channel_first=True,
+                explain_func=explain_func,
+                device=device,
+            )
+        except AssertionError as exc:
+            if "attribution vector are all equal to zero" not in str(exc):
+                raise
+            metric_scores["MaxSensitivity"] = [float("nan")]
+            metric_statuses["MaxSensitivity"] = "undefined_zero_perturbed_attribution"
+            metric_notes["MaxSensitivity"] = (
+                "Quantus could not evaluate MaxSensitivity because at least one "
+                "perturbed input produced an all-zero attribution map."
+            )
 
-    metric_scores["Sparseness"] = quantus.Sparseness(disable_warnings=True)(
+    if "Sparseness" in requested:
+        metric_scores["Sparseness"] = quantus.Sparseness(disable_warnings=True)(
             model=model,
             x_batch=x_batch,
             y_batch=y_batch,
@@ -250,16 +397,33 @@ def evaluate_quantus_metrics(
             "model_output": model_output,
             "xai_target": "predicted_kl_class_score" if is_ordinal else "predicted_class_logit",
         },
+        "Region perturbation score-drop AUC": {
+            "attribution": "normalise_by_max",
+            "abs": False,
+            "patch_size": REGION_PERTURBATION_PATCH_SIZE,
+            "regions_evaluation": REGION_PERTURBATION_REGIONS,
+            "order": "morf",
+            "perturbation": "replace_spatial_patch_in_all_channels",
+            "perturb_baseline": "fixed_per_channel_input_mean",
+            "summary": "trapezoidal_auc_of_target_score_drop_with_zero_origin",
+            "auc_step_axis": "normalised_0_to_1_over_evaluated_regions",
+            "softmax": False,
+            "model_output": model_output,
+            "xai_target": "predicted_kl_class_score" if is_ordinal else "predicted_class_logit",
+        },
         "MaxSensitivity": {
             "attribution": "raw_scale_preserving",
             "nr_samples": max_sensitivity_samples,
-            "perturbation": "gaussian_noise",
+            "perturbation": "quantus_batch_uniform_noise",
             "lower_bound": 0.05,
             "upper_bound": None,
             "model_output": model_output,
             "xai_target": "predicted_kl_class_score" if is_ordinal else "predicted_class_logit",
         },
-        "Sparseness": {"attribution": "raw_scale_preserving"},
+        "Sparseness": {
+            "attribution": "quantus_normalise_by_max",
+            "abs": True,
+        },
     }
 
     return [
