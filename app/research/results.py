@@ -31,6 +31,11 @@ OPTIONAL_COLUMNS = (
     "metric_parameters",
     "metric_status",
     "metric_note",
+    "attribution_l1_norm",
+    "attribution_l2_norm",
+    "attribution_max_abs",
+    "attribution_l2_after_max_normalisation",
+    "attribution_nonzero_fraction",
 )
 
 VALID_METRIC_CATEGORIES = frozenset(

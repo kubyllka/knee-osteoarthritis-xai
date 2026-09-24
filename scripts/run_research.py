@@ -184,9 +184,10 @@ def metric_row(
     metric_parameters: dict,
     metric_status: str = "ok",
     metric_note: str | None = None,
+    attribution_diagnostics: dict[str, float] | None = None,
 ) -> dict:
     predicted_kl = int(prediction["grade"])
-    return {
+    row = {
         "sample_id": sample.sample_id,
         "image_path": relative_image_path(sample),
         "true_kl": sample.true_kl,
@@ -210,6 +211,29 @@ def metric_row(
         "metric_status": metric_status,
         "metric_note": metric_note,
     }
+    if attribution_diagnostics is not None:
+        row.update(attribution_diagnostics)
+    return row
+
+
+def attribution_norm_diagnostics(attribution: np.ndarray) -> dict[str, float]:
+    """Return scale diagnostics relevant to MaxSensitivity's denominator."""
+    values = np.asarray(attribution, dtype=np.float64)
+    absolute = np.abs(values)
+    maximum = float(absolute.max()) if absolute.size else 0.0
+    return {
+        "attribution_l1_norm": float(absolute.sum()),
+        "attribution_l2_norm": float(np.linalg.norm(values.reshape(-1), ord=2)),
+        "attribution_max_abs": maximum,
+        "attribution_l2_after_max_normalisation": (
+            float(np.linalg.norm((values / maximum).reshape(-1), ord=2))
+            if np.isfinite(maximum) and maximum > 0.0
+            else float("nan")
+        ),
+        "attribution_nonzero_fraction": float(np.count_nonzero(absolute) / absolute.size)
+        if absolute.size
+        else 0.0,
+    }
 
 
 def custom_metric_rows(
@@ -223,6 +247,7 @@ def custom_metric_rows(
     checkpoint_version: str,
     device_name: str,
 ) -> list[dict]:
+    diagnostics = attribution_norm_diagnostics(xai_result.raw_attribution)
     stability_table, _ = build_stability_metrics(
         model=xai_model,
         image=xai_result.original,
@@ -252,6 +277,7 @@ def custom_metric_rows(
             stability_definition.source,
             stability_definition.score_direction,
             {"brightness_multiplier": 1.05, "contrast_multiplier": 1.05, "device": device_name, **ordinal_parameters},
+            attribution_diagnostics=diagnostics,
         ),
     ]
 
@@ -266,7 +292,9 @@ def quantus_metric_rows(
     seed: int,
     checkpoint_version: str,
     device_name: str,
+    attribution: np.ndarray,
 ) -> list[dict]:
+    diagnostics = attribution_norm_diagnostics(attribution)
     return [
         metric_row(
             sample,
@@ -284,6 +312,7 @@ def quantus_metric_rows(
             {**score.parameters, "device": device_name},
             score.status,
             score.note,
+            diagnostics,
         )
         for score in scores
     ]
@@ -299,6 +328,8 @@ def _validate_resume_configuration(
     faithfulness_runs: int,
     max_sensitivity_samples: int,
     device_name: str,
+    faithfulness_subset_size: int = 224,
+    max_sensitivity_normalise: bool = False,
 ) -> None:
     """Reject a resume attempt that would mix incompatible experimental settings."""
     expected = {
@@ -312,8 +343,14 @@ def _validate_resume_configuration(
             raise ValueError(f"Cannot resume: existing output has a different {column}.")
 
     expected_parameters = {
-        "FaithfulnessCorrelation": {"nr_runs": faithfulness_runs},
-        "MaxSensitivity": {"nr_samples": max_sensitivity_samples},
+        "FaithfulnessCorrelation": {
+            "nr_runs": faithfulness_runs,
+            "subset_size": faithfulness_subset_size,
+        },
+        "MaxSensitivity": {
+            "nr_samples": max_sensitivity_samples,
+            "normalise": max_sensitivity_normalise,
+        },
     }
     for metric_name, expected_values in expected_parameters.items():
         metric_rows = existing[existing["metric_name"] == metric_name]
@@ -423,6 +460,8 @@ def run_research(
     samples_per_kl: int | None,
     faithfulness_runs: int,
     max_sensitivity_samples: int,
+    faithfulness_subset_size: int = 224,
+    max_sensitivity_normalise: bool = False,
     device: str = "auto",
     resume: bool = False,
     metrics: set[str] | frozenset[str] | None = None,
@@ -465,6 +504,8 @@ def run_research(
             faithfulness_runs=faithfulness_runs,
             max_sensitivity_samples=max_sensitivity_samples,
             device_name=device_name,
+            faithfulness_subset_size=faithfulness_subset_size,
+            max_sensitivity_normalise=max_sensitivity_normalise,
         )
         rows = existing.to_dict("records")
     complete_pairs = (
@@ -596,7 +637,9 @@ def run_research(
                             xai_method=method,
                             model_name=model_name,
                             faithfulness_runs=faithfulness_runs,
+                            faithfulness_subset_size=faithfulness_subset_size,
                             max_sensitivity_samples=max_sensitivity_samples,
+                            max_sensitivity_normalise=max_sensitivity_normalise,
                             requested_metrics={metric_name},
                         )
                     )
@@ -611,6 +654,7 @@ def run_research(
                         seed,
                         checkpoint_version,
                         device_name,
+                        xai_result.raw_attribution,
                     )
                 )
             if "Stability score" in selected_metrics:
@@ -645,7 +689,22 @@ def parse_args():
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--samples-per-kl", type=int, default=None)
     parser.add_argument("--faithfulness-runs", type=int, default=50)
+    parser.add_argument(
+        "--faithfulness-subset-size",
+        type=int,
+        default=224,
+        help="Number of spatial RGB pixel groups perturbed per FaithfulnessCorrelation run.",
+    )
     parser.add_argument("--max-sensitivity-samples", type=int, default=8)
+    parser.add_argument(
+        "--max-sensitivity-normalise",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Normalise the original and every perturbed attribution independently by their "
+            "maximum absolute value inside Quantus MaxSensitivity."
+        ),
+    )
     parser.add_argument(
         "--metrics",
         nargs="+",
@@ -670,7 +729,11 @@ def parse_args():
         parser.error("--samples-per-kl must be positive")
     if args.limit is not None and args.samples_per_kl is not None:
         parser.error("Use either --limit or --samples-per-kl, not both")
-    if args.faithfulness_runs <= 0 or args.max_sensitivity_samples <= 0:
+    if (
+        args.faithfulness_runs <= 0
+        or args.faithfulness_subset_size <= 0
+        or args.max_sensitivity_samples <= 0
+    ):
         parser.error("Quantus sample counts must be positive")
     if args.random_control_repeats <= 0:
         parser.error("--random-control-repeats must be positive")
@@ -694,7 +757,9 @@ if __name__ == "__main__":
         limit=arguments.limit,
         samples_per_kl=arguments.samples_per_kl,
         faithfulness_runs=arguments.faithfulness_runs,
+        faithfulness_subset_size=arguments.faithfulness_subset_size,
         max_sensitivity_samples=arguments.max_sensitivity_samples,
+        max_sensitivity_normalise=arguments.max_sensitivity_normalise,
         device=arguments.device,
         resume=arguments.resume,
         metrics={METRIC_KEYS[key] for key in arguments.metrics},

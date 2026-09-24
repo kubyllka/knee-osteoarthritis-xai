@@ -86,6 +86,7 @@ class QuantusMetricsTests(unittest.TestCase):
                 xai_method="Grad-CAM",
                 model_name="resnet50",
                 faithfulness_runs=2,
+                faithfulness_subset_size=4,
                 max_sensitivity_samples=2,
             )
         except RuntimeError as exc:
@@ -103,6 +104,8 @@ class QuantusMetricsTests(unittest.TestCase):
         self.assertEqual(scores[0].score_direction, "higher")
         self.assertEqual(scores[0].parameters["attribution"], "normalise_by_max")
         self.assertEqual(scores[0].parameters["feature_unit"], "spatial_pixel_rgb_group")
+        self.assertEqual(scores[0].parameters["subset_size"], 4)
+        self.assertAlmostEqual(scores[0].parameters["subset_fraction"], 0.25)
         self.assertEqual(
             scores[0].parameters["perturbation"],
             "replace_selected_spatial_pixels_in_all_channels",
@@ -143,6 +146,7 @@ class QuantusMetricsTests(unittest.TestCase):
             xai_method="Grad-CAM",
             model_name="resnet50",
             faithfulness_runs=2,
+            faithfulness_subset_size=4,
             max_sensitivity_samples=2,
             requested_metrics={"FaithfulnessCorrelation", "MaxSensitivity", "Sparseness"},
         )
@@ -150,6 +154,55 @@ class QuantusMetricsTests(unittest.TestCase):
         self.assertEqual([score.status for score in scores], ["ok", "undefined_zero_perturbed_attribution", "ok"])
         self.assertTrue(np.isnan(scores[1].value))
         self.assertIn("all-zero attribution", scores[1].note)
+
+    @patch("app.quantus_metrics._load_quantus")
+    def test_sensitivity_parameters_are_explicit_and_recorded(self, mock_quantus) -> None:
+        constructor_kwargs = {}
+
+        class CapturingMaxSensitivity:
+            def __init__(self, **kwargs):
+                constructor_kwargs.update(kwargs)
+
+            def __call__(self, **_):
+                return [0.25]
+
+        class FakeQuantus:
+            MaxSensitivity = CapturingMaxSensitivity
+            normalise_by_max = staticmethod(lambda values: values / np.max(np.abs(values)))
+
+        mock_quantus.return_value = FakeQuantus
+        scores = evaluate_quantus_metrics(
+            model=TinyClassifier(),
+            input_tensor=torch.arange(48, dtype=torch.float32).reshape(1, 3, 4, 4) / 47,
+            attribution=np.arange(16, dtype=np.float32).reshape(4, 4),
+            target_class=0,
+            xai_method="Grad-CAM++",
+            model_name="resnet50",
+            faithfulness_subset_size=8,
+            max_sensitivity_samples=3,
+            max_sensitivity_normalise=True,
+            requested_metrics={"MaxSensitivity"},
+        )
+
+        self.assertTrue(constructor_kwargs["normalise"])
+        self.assertIs(constructor_kwargs["normalise_func"], FakeQuantus.normalise_by_max)
+        self.assertEqual(constructor_kwargs["nr_samples"], 3)
+        self.assertEqual(scores[0].parameters["normalise"], True)
+        self.assertEqual(scores[0].parameters["attribution"], "quantus_normalise_by_max_separately")
+
+    @patch("app.quantus_metrics._load_quantus", return_value=object())
+    def test_faithfulness_subset_size_must_fit_spatial_map(self, _load) -> None:
+        with self.assertRaisesRegex(ValueError, "smaller than"):
+            evaluate_quantus_metrics(
+                model=TinyClassifier(),
+                input_tensor=torch.zeros((1, 3, 4, 4), dtype=torch.float32),
+                attribution=np.ones((4, 4), dtype=np.float32),
+                target_class=0,
+                xai_method="Grad-CAM",
+                model_name="resnet50",
+                faithfulness_subset_size=16,
+                requested_metrics={"FaithfulnessCorrelation"},
+            )
 
 
 if __name__ == "__main__":

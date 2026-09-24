@@ -80,6 +80,23 @@ models/densenet121_ordinal_finetune_block3_4_best_21092026.pth
 
 They produce four threshold logits. The KL prediction uses the validation-time rule `sum(sigmoid(logits) > 0.5)`. Class-dependent XAI methods and Quantus use a differentiable five-class ordinal score derived from those thresholds; Eigen-CAM remains class-independent.
 
+For a balanced 50-image parameter sensitivity check, run each configuration into a separate CSV. `224`, `1024`, and `2048` spatial pixels correspond to approximately `0.45%`, `2.04%`, and `4.08%` of a 224 x 224 attribution map:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_research.py --model resnet50 --methods "Grad-CAM" "Grad-CAM++" "Eigen-CAM" "SmoothGrad" "Integrated Gradients" --metrics faithfulness-correlation --samples-per-kl 10 --faithfulness-runs 30 --faithfulness-subset-size 224 --output results/research/resnet50-faithfulness-224.csv
+.\.venv\Scripts\python.exe scripts\run_research.py --model resnet50 --methods "Grad-CAM" "Grad-CAM++" "Eigen-CAM" "SmoothGrad" "Integrated Gradients" --metrics faithfulness-correlation --samples-per-kl 10 --faithfulness-runs 30 --faithfulness-subset-size 1024 --output results/research/resnet50-faithfulness-1024.csv
+.\.venv\Scripts\python.exe scripts\run_research.py --model resnet50 --methods "Grad-CAM" "Grad-CAM++" "Eigen-CAM" "SmoothGrad" "Integrated Gradients" --metrics faithfulness-correlation --samples-per-kl 10 --faithfulness-runs 30 --faithfulness-subset-size 2048 --output results/research/resnet50-faithfulness-2048.csv
+```
+
+Compare MaxSensitivity with and without independent max-normalisation of the original and perturbed maps:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_research.py --model resnet50 --methods "Grad-CAM" "Grad-CAM++" "Eigen-CAM" "SmoothGrad" "Integrated Gradients" --metrics max-sensitivity --samples-per-kl 10 --max-sensitivity-samples 8 --no-max-sensitivity-normalise --output results/research/resnet50-maxsensitivity-raw.csv
+.\.venv\Scripts\python.exe scripts\run_research.py --model resnet50 --methods "Grad-CAM" "Grad-CAM++" "Eigen-CAM" "SmoothGrad" "Integrated Gradients" --metrics max-sensitivity --samples-per-kl 10 --max-sensitivity-samples 8 --max-sensitivity-normalise --output results/research/resnet50-maxsensitivity-normalised.csv
+```
+
+New result rows also store the initial map's L1, L2, maximum-absolute, max-normalised L2, and non-zero-fraction diagnostics. These columns are descriptive checks for scale-related MaxSensitivity extremes; they are not additional XAI quality metrics.
+
 Export the matching ONNX files with:
 
 ```powershell

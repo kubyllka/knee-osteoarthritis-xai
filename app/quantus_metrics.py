@@ -273,7 +273,9 @@ def evaluate_quantus_metrics(
     xai_method: str,
     model_name: str,
     faithfulness_runs: int = 50,
+    faithfulness_subset_size: int = 224,
     max_sensitivity_samples: int = 8,
+    max_sensitivity_normalise: bool = False,
     requested_metrics: set[str] | frozenset[str] | None = None,
 ) -> list[QuantusScore]:
     """Evaluate one XAI map with the initial Quantus metric set."""
@@ -288,7 +290,14 @@ def evaluate_quantus_metrics(
     y_batch = np.asarray([target_class], dtype=np.int64)
     a_batch = attribution[np.newaxis, np.newaxis, :, :].astype(np.float32)
     feature_count = int(attribution.shape[0] * attribution.shape[1])
-    subset_size = max(1, min(224, feature_count - 1))
+    if faithfulness_subset_size <= 0:
+        raise ValueError("faithfulness_subset_size must be positive")
+    if faithfulness_subset_size >= feature_count:
+        raise ValueError(
+            "faithfulness_subset_size must be smaller than the number of spatial attribution pixels "
+            f"({feature_count})."
+        )
+    subset_size = faithfulness_subset_size
     device = str(_model_device(model))
     is_ordinal = MODEL_CONFIGS.get(model_name, {}).get("output_type") == "ordinal_thresholds"
     model_output = "ordinal_class_log_score" if is_ordinal else "logit"
@@ -350,11 +359,15 @@ def evaluate_quantus_metrics(
         ]
     if "MaxSensitivity" in requested:
         try:
-            metric_scores["MaxSensitivity"] = quantus.MaxSensitivity(
-                nr_samples=max_sensitivity_samples,
-                lower_bound=0.05,
-                disable_warnings=True,
-            )(
+            max_sensitivity_kwargs = {
+                "nr_samples": max_sensitivity_samples,
+                "lower_bound": 0.05,
+                "normalise": max_sensitivity_normalise,
+                "disable_warnings": True,
+            }
+            if max_sensitivity_normalise:
+                max_sensitivity_kwargs["normalise_func"] = quantus.normalise_by_max
+            metric_scores["MaxSensitivity"] = quantus.MaxSensitivity(**max_sensitivity_kwargs)(
                 model=model,
                 x_batch=x_batch,
                 y_batch=y_batch,
@@ -389,6 +402,7 @@ def evaluate_quantus_metrics(
             "abs": False,
             "nr_runs": faithfulness_runs,
             "subset_size": subset_size,
+            "subset_fraction": subset_size / feature_count,
             "feature_unit": "spatial_pixel_rgb_group",
             "perturbation": "replace_selected_spatial_pixels_in_all_channels",
             "perturb_baseline": "per_channel_input_mean",
@@ -412,7 +426,13 @@ def evaluate_quantus_metrics(
             "xai_target": "predicted_kl_class_score" if is_ordinal else "predicted_class_logit",
         },
         "MaxSensitivity": {
-            "attribution": "raw_scale_preserving",
+            "attribution": (
+                "quantus_normalise_by_max_separately"
+                if max_sensitivity_normalise
+                else "raw_scale_preserving"
+            ),
+            "normalise": max_sensitivity_normalise,
+            "normalise_func": "normalise_by_max",
             "nr_samples": max_sensitivity_samples,
             "perturbation": "quantus_batch_uniform_noise",
             "lower_bound": 0.05,
