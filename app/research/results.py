@@ -21,6 +21,7 @@ REQUIRED_COLUMNS = (
 )
 
 OPTIONAL_COLUMNS = (
+    "model_id",
     "run_id",
     "split",
     "seed",
@@ -36,6 +37,15 @@ OPTIONAL_COLUMNS = (
     "attribution_max_abs",
     "attribution_l2_after_max_normalisation",
     "attribution_nonzero_fraction",
+    "experiment_profile",
+    "model_architecture",
+    "training_variant",
+    "kl1_loss_multiplier",
+    "manifest_sha256",
+    "selected_sample_content_sha256",
+    "checkpoint_sha256",
+    "onnx_sha256",
+    "xai_map_target",
 )
 
 VALID_METRIC_CATEGORIES = frozenset(
@@ -116,6 +126,18 @@ def validate_research_results(results: pd.DataFrame) -> pd.DataFrame:
     cleaned = results.copy()
     for column in ("sample_id", "image_path", "model_name", "xai_method", "metric_name"):
         _require_non_empty_text(cleaned, column)
+    if "model_id" in cleaned.columns:
+        _require_non_empty_text(cleaned, "model_id")
+        if not cleaned["model_id"].eq(cleaned["model_name"]).all():
+            raise ResearchResultsValidationError("model_id must equal model_name for research results.")
+    if "xai_map_target" in cleaned.columns:
+        _require_non_empty_text(cleaned, "xai_map_target")
+        valid_targets = {"class_agnostic", "predicted_kl"}
+        if not set(cleaned["xai_map_target"]).issubset(valid_targets):
+            raise ResearchResultsValidationError("xai_map_target must be class_agnostic or predicted_kl.")
+        expected_map_target = np.where(cleaned["xai_method"].eq("Eigen-CAM"), "class_agnostic", "predicted_kl")
+        if not cleaned["xai_map_target"].eq(expected_map_target).all():
+            raise ResearchResultsValidationError("xai_map_target must reflect whether the XAI method is class-agnostic.")
 
     cleaned["true_kl"] = _integer_column(cleaned, "true_kl", 0, 4)
     cleaned["predicted_kl"] = _integer_column(cleaned, "predicted_kl", 0, 4)
@@ -187,8 +209,16 @@ def validate_research_results(results: pd.DataFrame) -> pd.DataFrame:
 
     if "seed" in cleaned.columns:
         cleaned["seed"] = _integer_column(cleaned, "seed", 0, 2**63 - 1)
+    if "kl1_loss_multiplier" in cleaned.columns:
+        cleaned["kl1_loss_multiplier"] = _finite_float_column(cleaned, "kl1_loss_multiplier", 0.0)
+        if cleaned["kl1_loss_multiplier"].le(0).any():
+            raise ResearchResultsValidationError("kl1_loss_multiplier must be positive.")
 
-    for column in ("run_id", "split", "checkpoint_version"):
+    for column in (
+        "run_id", "split", "checkpoint_version", "experiment_profile", "model_architecture",
+        "training_variant", "manifest_sha256", "selected_sample_content_sha256",
+        "checkpoint_sha256", "onnx_sha256",
+    ):
         if column in cleaned.columns:
             cleaned[column] = cleaned[column].astype("string").str.strip()
 

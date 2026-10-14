@@ -115,6 +115,17 @@ def merge_research_results(frames: Iterable[pd.DataFrame]) -> pd.DataFrame:
         raise ResearchAnalysisError("Select at least one research-results CSV.")
     merged = pd.concat(validated, ignore_index=True)
     _require_unique_rows(merged)
+    for column in (
+        "checkpoint_version", "checkpoint_sha256", "onnx_sha256", "training_variant",
+        "model_architecture", "kl1_loss_multiplier", "experiment_profile", "manifest_sha256",
+    ):
+        if column in merged.columns:
+            mixed = merged.groupby("model_name")[column].nunique(dropna=False)
+            if (mixed > 1).any():
+                raise ResearchAnalysisError(
+                    f"Incompatible {column} within model ID {mixed[mixed > 1].index[0]}; "
+                    "select one compatible experiment per model."
+                )
     return merged
 
 
@@ -420,24 +431,27 @@ def wilcoxon_method_posthoc(
     )
 
 
-def _require_architecture_configuration_compatibility(results: pd.DataFrame) -> None:
-    """Require each metric/method to use identical parameters for both architectures."""
-    selected = results[results["model_name"].isin(ARCHITECTURE_MODELS)].copy()
+def _require_architecture_configuration_compatibility(
+    results: pd.DataFrame, models: tuple[str, str] = ARCHITECTURE_MODELS
+) -> None:
+    """Require each metric/method to use identical parameters for a selected model pair."""
+    selected = results[results["model_name"].isin(models)].copy()
     selected["_signature"] = selected["metric_parameters"].map(_canonical_parameters)
     signatures = selected.groupby(["xai_method", "metric_name"])["_signature"].nunique()
     mixed = signatures[signatures > 1]
     if not mixed.empty:
         method, metric = mixed.index[0]
         raise ResearchAnalysisError(
-            "Architecture comparison requires matching metric parameters for DenseNet121 and ResNet50: "
+            f"Model comparison requires matching metric parameters for {models[0]} and {models[1]}: "
             f"{method}/{metric} differs."
         )
 
 
 def architecture_complete_case_pairs(
-    results: pd.DataFrame, *, same_target_only: bool = False
+    results: pd.DataFrame, *, same_target_only: bool = False,
+    models: tuple[str, str] = ARCHITECTURE_MODELS,
 ) -> dict[tuple[str, str], pd.DataFrame]:
-    """Pair DenseNet121 and ResNet50 values by sample for each method and metric.
+    """Pair two model configurations by sample for each method and metric.
 
     When ``same_target_only`` is set, only samples with the same predicted KL
     class in both architectures remain. This is a sensitivity analysis because
@@ -446,25 +460,35 @@ def architecture_complete_case_pairs(
     _require_unique_rows(results)
     _require_prediction_metadata_consistency(results)
     _require_metric_configuration_consistency(results)
-    if not set(ARCHITECTURE_MODELS).issubset(set(results["model_name"].unique())):
+    if len(models) != 2 or models[0] == models[1]:
+        raise ResearchAnalysisError("Select two different model IDs for a paired comparison.")
+    if not set(models).issubset(set(results["model_name"].unique())):
         raise ResearchAnalysisError(
-            "Architecture comparison requires both densenet121 and resnet50 result files."
+            f"Model comparison requires result files for both {models[0]} and {models[1]}."
         )
-    _require_architecture_configuration_compatibility(results)
+    _require_architecture_configuration_compatibility(results, models)
 
     predictions = prediction_records(results)
+    paired_metadata = predictions[predictions["model_name"].isin(models)]
+    for field in ("image_path", "true_kl"):
+        conflicts = paired_metadata.groupby("sample_id")[field].nunique(dropna=False)
+        if (conflicts > 1).any():
+            raise ResearchAnalysisError(
+                f"Cannot pair {models[0]} and {models[1]}: {field} differs for sample_id "
+                f"{conflicts[conflicts > 1].index[0]}."
+            )
     predicted_wide = predictions[
-        predictions["model_name"].isin(ARCHITECTURE_MODELS)
+        predictions["model_name"].isin(models)
     ].pivot(index="sample_id", columns="model_name", values="predicted_kl")
     shared_prediction_samples = set(predicted_wide.dropna().index)
     if same_target_only:
         shared_prediction_samples = {
             sample_id
             for sample_id, row in predicted_wide.dropna().iterrows()
-            if int(row["densenet121"]) == int(row["resnet50"])
+            if int(row[models[0]]) == int(row[models[1]])
         }
 
-    selected = results[results["model_name"].isin(ARCHITECTURE_MODELS)].copy()
+    selected = results[results["model_name"].isin(models)].copy()
     status = selected.get("metric_status", pd.Series("ok", index=selected.index))
     numeric = selected[status.eq("ok")].copy()
     numeric["metric_value"] = pd.to_numeric(numeric["metric_value"], errors="coerce")
@@ -478,23 +502,24 @@ def architecture_complete_case_pairs(
             ]
             sample_sets = [
                 set(all_rows.loc[all_rows["model_name"].eq(model), "sample_id"])
-                for model in ARCHITECTURE_MODELS
+                for model in models
             ]
             candidate_samples = set.intersection(*sample_sets) & shared_prediction_samples
             valid_rows = numeric[
                 numeric["xai_method"].eq(method) & numeric["metric_name"].eq(metric_name)
             ]
             if valid_rows.empty:
-                matrix = pd.DataFrame(columns=ARCHITECTURE_MODELS, dtype=float)
+                matrix = pd.DataFrame(columns=models, dtype=float)
                 matrix.index.name = "sample_id"
             else:
                 matrix = valid_rows.pivot(
                     index="sample_id", columns="model_name", values="metric_value"
-                ).reindex(index=sorted(candidate_samples), columns=ARCHITECTURE_MODELS)
+                ).reindex(index=sorted(candidate_samples), columns=models)
                 matrix = matrix.dropna(axis=0, how="any").sort_index()
             matrix.attrs["candidate_n"] = len(candidate_samples)
             matrix.attrs["excluded_n"] = len(candidate_samples) - len(matrix)
             matrix.attrs["same_target_only"] = same_target_only
+            matrix.attrs["models"] = models
             pairs[(method, metric_name)] = matrix
     return pairs
 
@@ -541,30 +566,40 @@ def _rank_biserial_correlation(differences: np.ndarray) -> float:
 
 
 def architecture_comparison_analysis(pairs: dict[tuple[str, str], pd.DataFrame]) -> pd.DataFrame:
-    """Run paired DenseNet121-vs-ResNet50 Wilcoxon tests with Holm over 25 tests."""
+    """Run paired Wilcoxon tests for one model pair, with Holm over 25 tests."""
     rows = []
     for (method, metric_name), matrix in pairs.items():
+        models = tuple(matrix.attrs.get("models", ARCHITECTURE_MODELS))
+        first, second = models
+        first_label = "DenseNet121" if first == "densenet121" else "ResNet50" if first == "resnet50" else first
+        second_label = "DenseNet121" if second == "densenet121" else "ResNet50" if second == "resnet50" else second
+        difference_label = (
+            "Median paired difference (DenseNet - ResNet)"
+            if models == ARCHITECTURE_MODELS else
+            f"Median paired difference ({first_label} - {second_label})"
+        )
         paired_n = len(matrix)
         row: dict[str, object] = {
             "XAI method": method,
             "Metric": metric_name,
+            "Model pair": models,
             "Paired N": paired_n,
             "Excluded N": int(matrix.attrs.get("excluded_n", 0)),
-            "Median paired difference (DenseNet - ResNet)": np.nan,
+            difference_label: np.nan,
             "Wilcoxon statistic": np.nan,
             "p raw": np.nan,
             "Rank-biserial correlation": np.nan,
             "Test status": "ok",
         }
         if paired_n:
-            row.update(_architecture_distribution("DenseNet121", matrix["densenet121"]))
-            row.update(_architecture_distribution("ResNet50", matrix["resnet50"]))
-            differences = matrix["densenet121"].to_numpy() - matrix["resnet50"].to_numpy()
-            row["Median paired difference (DenseNet - ResNet)"] = float(np.median(differences))
+            row.update(_architecture_distribution(first_label, matrix[first]))
+            row.update(_architecture_distribution(second_label, matrix[second]))
+            differences = matrix[first].to_numpy() - matrix[second].to_numpy()
+            row[difference_label] = float(np.median(differences))
         else:
             row.update({
-                "DenseNet121 median": np.nan, "DenseNet121 Q1": np.nan, "DenseNet121 Q3": np.nan,
-                "ResNet50 median": np.nan, "ResNet50 Q1": np.nan, "ResNet50 Q3": np.nan,
+                f"{first_label} median": np.nan, f"{first_label} Q1": np.nan, f"{first_label} Q3": np.nan,
+                f"{second_label} median": np.nan, f"{second_label} Q1": np.nan, f"{second_label} Q3": np.nan,
             })
             row["Test status"] = "no complete paired samples"
         if paired_n < 2:
@@ -579,8 +614,8 @@ def architecture_comparison_analysis(pairs: dict[tuple[str, str], pd.DataFrame])
             })
         else:
             statistic, p_value = wilcoxon(
-                matrix["densenet121"],
-                matrix["resnet50"],
+                matrix[first],
+                matrix[second],
                 alternative="two-sided",
                 zero_method="wilcox",
                 method="auto",

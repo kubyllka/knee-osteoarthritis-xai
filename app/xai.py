@@ -64,25 +64,27 @@ def load_checkpoint(model: torch.nn.Module, checkpoint_path: Path) -> torch.nn.M
 
 
 def create_xai_model(model_name: str) -> torch.nn.Module:
-    if model_name == "resnet50":
+    architecture = MODEL_CONFIGS.get(model_name, {}).get("architecture", model_name)
+    if architecture == "resnet50":
         return create_resnet50_ordinal_model(num_classes=NUM_CLASSES, freeze_backbone=False)
-    if model_name == "densenet121":
+    if architecture == "densenet121":
         return create_densenet121_ordinal_model(num_classes=NUM_CLASSES, freeze_backbone=False)
-    if model_name == "vit":
+    if architecture == "vit":
         return create_vit_model(num_classes=NUM_CLASSES, freeze_backbone=False)
     raise ValueError(f"Unsupported model name: {model_name}")
 
 
 def get_target_layer_and_transform(model: torch.nn.Module, model_name: str):
     model = model.base_model if isinstance(model, OrdinalClassScoreModel) else model
-    if model_name == "resnet50":
+    architecture = MODEL_CONFIGS.get(model_name, {}).get("architecture", model_name)
+    if architecture == "resnet50":
         return model.layer4[-1], identity_reshape_transform
-    if model_name == "densenet121":
+    if architecture == "densenet121":
         # DenseNet applies an in-place ReLU immediately after norm5. A full
         # backward hook on norm5 conflicts with that operation in PyTorch, so
         # use the preceding final dense block as the Grad-CAM target instead.
         return model.features.denseblock4, identity_reshape_transform
-    if model_name == "vit":
+    if architecture == "vit":
         return model.encoder.layers[-1].ln_1, vit_reshape_transform
     raise ValueError(f"Unsupported model name: {model_name}")
 

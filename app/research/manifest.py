@@ -1,4 +1,6 @@
 import json
+import hashlib
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -87,3 +89,39 @@ def load_dataset_manifest(path: str | Path) -> list[DatasetSample]:
         ) from exc
 
     return parse_dataset_manifest(payload)
+
+
+def validate_final_test_manifest(
+    samples: list[DatasetSample],
+    original_samples: list[DatasetSample],
+    samples_per_kl: int = 50,
+) -> None:
+    """Require one balanced test cohort containing the unchanged original subset."""
+    counts = Counter(sample.true_kl for sample in samples)
+    if any(counts[grade] != samples_per_kl for grade in range(5)):
+        raise DatasetManifestValidationError(
+            f"Final test manifest must contain {samples_per_kl} images for each KL0–KL4 grade; "
+            f"found {dict(sorted(counts.items()))}."
+        )
+    if any(sample.split != "test" for sample in samples):
+        raise DatasetManifestValidationError("Every final-manifest sample must belong to the test split.")
+    by_id = {sample.sample_id: sample for sample in samples}
+    if len(by_id) != len(samples):
+        raise DatasetManifestValidationError("Final manifest contains duplicate sample_id values.")
+    for original in original_samples:
+        current = by_id.get(original.sample_id)
+        if current is None or (current.image_path.resolve(), current.true_kl, current.split) != (
+            original.image_path.resolve(), original.true_kl, original.split
+        ):
+            raise DatasetManifestValidationError(
+                f"Original sample must retain its ID, path, KL label and split: {original.sample_id}."
+            )
+    paths = [sample.image_path.resolve() for sample in samples]
+    if len(set(paths)) != len(paths):
+        raise DatasetManifestValidationError("Final manifest lists the same image path more than once.")
+    content_hashes = []
+    for sample in samples:
+        digest = hashlib.sha256(sample.image_path.read_bytes()).hexdigest()
+        content_hashes.append(digest)
+    if len(set(content_hashes)) != len(content_hashes):
+        raise DatasetManifestValidationError("Final manifest contains duplicate image file contents.")

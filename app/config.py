@@ -18,6 +18,9 @@ MODEL_CONFIGS = {
     },
     "resnet50": {
         "display_name": "ResNet-50 (ordinal BCE)",
+        "architecture": "resnet50",
+        "training_variant": "ordinal_bce",
+        "kl1_loss_multiplier": 1.0,
         "onnx_path": RESNET_ONNX_MODEL_PATH,
         "checkpoint_path": RESNET_PYTORCH_CHECKPOINT_PATH,
         "output_type": "ordinal_thresholds",
@@ -25,12 +28,42 @@ MODEL_CONFIGS = {
     },
     "densenet121": {
         "display_name": "DenseNet-121 (ordinal BCE)",
+        "architecture": "densenet121",
+        "training_variant": "ordinal_bce",
+        "kl1_loss_multiplier": 1.0,
         "onnx_path": DENSENET_ONNX_MODEL_PATH,
         "checkpoint_path": DENSENET_PYTORCH_CHECKPOINT_PATH,
         "output_type": "ordinal_thresholds",
         "num_outputs": 4,
     },
+    "resnet50_class_aware": {
+        "display_name": "ResNet-50 (class-aware ordinal BCE)",
+        "architecture": "resnet50",
+        "training_variant": "class_aware_ordinal_bce",
+        "kl1_loss_multiplier": 1.5,
+        "onnx_path": MODEL_DIR / "resnet50_class_aware_ordinal.onnx",
+        "checkpoint_path": MODEL_DIR / "resnet50_class_aware_ordinal.pth",
+        "output_type": "ordinal_thresholds",
+        "num_outputs": 4,
+    },
+    "densenet121_class_aware": {
+        "display_name": "DenseNet-121 (class-aware ordinal BCE)",
+        "architecture": "densenet121",
+        "training_variant": "class_aware_ordinal_bce",
+        "kl1_loss_multiplier": 1.5,
+        "onnx_path": MODEL_DIR / "densenet121_class_aware_ordinal.onnx",
+        "checkpoint_path": MODEL_DIR / "densenet121_class_aware_ordinal.pth",
+        "output_type": "ordinal_thresholds",
+        "num_outputs": 4,
+    },
 }
+
+RESEARCH_MODEL_IDS = (
+    "resnet50",
+    "resnet50_class_aware",
+    "densenet121",
+    "densenet121_class_aware",
+)
 
 NUM_CLASSES = 5
 IMAGE_SIZE = 224

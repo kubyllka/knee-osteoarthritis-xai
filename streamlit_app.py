@@ -1,4 +1,5 @@
 from io import BytesIO
+import json
 from pathlib import Path
 import random
 
@@ -59,7 +60,7 @@ DISCLAIMER = (
 
 XAI_METHODS = ["Grad-CAM", "Grad-CAM++", "Eigen-CAM", "Integrated Gradients", "SmoothGrad"]
 DEFAULT_XAI_METHODS = ["Grad-CAM", "Grad-CAM++", "Eigen-CAM"]
-RESEARCH_RESULTS_DIR = Path("results/research")
+RESEARCH_RESULTS_DIR = Path(__file__).resolve().parent / "results/research"
 QUICK_FAITHFULNESS_RUNS = 8
 QUICK_MAX_SENSITIVITY_SAMPLES = 2
 
@@ -189,7 +190,9 @@ def _metric_category(metric_name: str, csv_category: str) -> str:
 def _is_custom_check(metric_name: str, csv_source: str | None) -> bool:
     """Keep project-specific checks visible even when their scientific dimension differs."""
     definition = metric_definition(metric_name)
-    return definition.source == "custom" if definition else csv_source == "custom"
+    if definition:
+        return metric_name in {"Deletion confidence drop", "Stability score"}
+    return csv_source == "custom"
 
 
 def _selected_metric_rows(frame: pd.DataFrame, metric_name: str) -> pd.DataFrame:
@@ -649,7 +652,7 @@ def _architecture_comparison_plot_data(values: pd.DataFrame, metric_name: str) -
     """Keep one metric scale in each architecture-comparison chart."""
     data = values[values["Metric"].eq(metric_name)].copy()
     data["XAI method"] = pd.Categorical(data["XAI method"], categories=XAI_METHODS, ordered=True)
-    data["Model"] = pd.Categorical(data["Model"], categories=["densenet121", "resnet50"], ordered=True)
+    data["Model"] = pd.Categorical(data["Model"], categories=list(values["Model"].unique()), ordered=True)
     return data.sort_values(["XAI method", "Model", "sample_id"]).reset_index(drop=True)
 
 
@@ -657,7 +660,9 @@ def _architecture_median_summary(analysis: pd.DataFrame, metric_name: str) -> pd
     selected = analysis[analysis["Metric"].eq(metric_name)]
     rows = []
     for _, row_data in selected.iterrows():
-        for model_name, label in (("densenet121", "DenseNet121"), ("resnet50", "ResNet50")):
+        model_pair = tuple(row_data.get("Model pair", ("densenet121", "resnet50")))
+        for model_name in model_pair:
+            label = "DenseNet121" if model_name == "densenet121" else "ResNet50" if model_name == "resnet50" else model_name
             rows.append(
                 {
                     "XAI method": row_data["XAI method"],
@@ -673,7 +678,7 @@ def _architecture_median_summary(analysis: pd.DataFrame, metric_name: str) -> pd
         return summary
     summary["Median label"] = summary["Median"].map(lambda value: "—" if pd.isna(value) else f"{value:.3g}")
     summary["XAI method"] = pd.Categorical(summary["XAI method"], categories=XAI_METHODS, ordered=True)
-    summary["Model"] = pd.Categorical(summary["Model"], categories=["densenet121", "resnet50"], ordered=True)
+    summary["Model"] = pd.Categorical(summary["Model"], categories=list(summary["Model"].unique()), ordered=True)
     return summary.sort_values(["XAI method", "Model"]).reset_index(drop=True)
 
 
@@ -681,13 +686,12 @@ def _architecture_comparison_chart(values: pd.DataFrame, analysis: pd.DataFrame,
     data = _architecture_comparison_plot_data(values, metric_name)
     summary = _architecture_median_summary(analysis, metric_name)
     y_scale = _method_comparison_y_scale(values, metric_name)
-    color_scale = alt.Scale(
-        domain=["densenet121", "resnet50"], range=["#e76f51", "#2563eb"]
-    )
+    model_pair = list(data["Model"].cat.categories)
+    color_scale = alt.Scale(domain=model_pair, range=["#e76f51", "#2563eb"])
     base = alt.Chart(data).encode(
         x=alt.X("XAI method:N", title="XAI method", sort=XAI_METHODS, axis=alt.Axis(labelAngle=-30)),
-        xOffset=alt.XOffset("Model:N", sort=["densenet121", "resnet50"]),
-        color=alt.Color("Model:N", title="Architecture", sort=["densenet121", "resnet50"], scale=color_scale),
+        xOffset=alt.XOffset("Model:N", sort=model_pair),
+        color=alt.Color("Model:N", title="Model", sort=model_pair, scale=color_scale),
     )
     boxes = base.mark_boxplot(size=30).encode(
         y=alt.Y(
@@ -698,10 +702,10 @@ def _architecture_comparison_chart(values: pd.DataFrame, analysis: pd.DataFrame,
     )
     medians = alt.Chart(summary).mark_point(shape="diamond", filled=True, color="#111827", size=48).encode(
         x=alt.X("XAI method:N", sort=XAI_METHODS),
-        xOffset=alt.XOffset("Model:N", sort=["densenet121", "resnet50"]),
+        xOffset=alt.XOffset("Model:N", sort=model_pair),
         y=alt.Y("Median:Q", scale=y_scale),
         tooltip=[
-            alt.Tooltip("Model label:N", title="Architecture"),
+            alt.Tooltip("Model label:N", title="Model"),
             alt.Tooltip("XAI method:N"),
             alt.Tooltip("Paired N:Q"),
             alt.Tooltip("Excluded N:Q"),
@@ -710,7 +714,7 @@ def _architecture_comparison_chart(values: pd.DataFrame, analysis: pd.DataFrame,
     )
     labels = alt.Chart(summary).mark_text(dy=-11, color="#111827", fontSize=9).encode(
         x=alt.X("XAI method:N", sort=XAI_METHODS),
-        xOffset=alt.XOffset("Model:N", sort=["densenet121", "resnet50"]),
+        xOffset=alt.XOffset("Model:N", sort=model_pair),
         y=alt.Y("Median:Q", scale=y_scale),
         text="Median label:N",
     )
@@ -815,12 +819,51 @@ def _correctness_distribution_chart(
     ).properties(height=340)
 
 
+@st.cache_data(show_spinner="Calculating KL-stratified correctness sensitivity tests…")
+def _cached_prediction_correctness_analysis(results: pd.DataFrame) -> pd.DataFrame:
+    return prediction_correctness_analysis(results)
+
+
 def _show_results_analysis(results: pd.DataFrame) -> None:
     st.subheader("Research overview")
     st.caption(
-        "This overview uses every image in the loaded XAI result files. Top filters apply only to "
+        "This overview uses the selected image cohort from the loaded XAI result files. Top filters apply only to "
         "Explore metrics, so they cannot distort classifier-subset accuracy or primary KL-stage analysis."
     )
+
+    model_sets = {model_id: set(group["sample_id"]) for model_id, group in results.groupby("model_name")}
+    different_cohorts = len({frozenset(ids) for ids in model_sets.values()}) > 1
+    cohort_options = ["All loaded images"]
+    if len(model_sets) > 1:
+        cohort_options.append("Images shared by all loaded models")
+    original_ids = set()
+    base_manifest = Path(__file__).resolve().parent / "inputs/test/test_manifest.json"
+    if base_manifest.is_file():
+        try:
+            original_ids = {
+                str(sample["sample_id"])
+                for sample in json.loads(base_manifest.read_text(encoding="utf-8"))["samples"]
+            }
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    if original_ids:
+        cohort_options.append("Original 150-image subset")
+    if different_cohorts:
+        st.warning(
+            "Loaded models do not have identical image sets. Per-model summaries use their own available images; "
+            "paired tests use only shared sample IDs. Select a common cohort for direct comparisons."
+        )
+    cohort = st.selectbox(
+        "Results-analysis cohort", cohort_options,
+        index=1 if different_cohorts and len(model_sets) > 1 else 0,
+    )
+    if cohort == "Images shared by all loaded models":
+        results = results[results["sample_id"].isin(set.intersection(*model_sets.values()))].copy()
+    elif cohort == "Original 150-image subset":
+        results = results[results["sample_id"].isin(original_ids)].copy()
+    if results.empty:
+        st.info("No images are available in the selected cohort.")
+        return
 
     try:
         classifier_summary, classifier_by_grade, confusion_matrices = classifier_subset_summary(results)
@@ -929,67 +972,82 @@ def _show_results_analysis(results: pd.DataFrame) -> None:
                 mime="text/csv",
             )
 
-    st.markdown("#### Architecture comparison")
+    st.markdown("#### Paired model comparison")
     st.caption(
-        "DenseNet121 and ResNet50 are compared only on the same image, XAI method, and metric. "
-        "Each metric remains separate: this section does not create an overall architecture winner."
+        "Compare architectures within one training variant, or training variants within one architecture. "
+        "Only the same image, XAI method and metric are paired; no overall model winner is inferred."
     )
-    try:
-        architecture_primary_pairs = architecture_complete_case_pairs(results)
-        architecture_same_target_pairs = architecture_complete_case_pairs(results, same_target_only=True)
-    except ResearchAnalysisError as exc:
-        st.info(f"Architecture comparison is unavailable: {exc}")
+    possible_pairs = [
+        ("Architecture: ordinal BCE", ("densenet121", "resnet50")),
+        ("Architecture: class-aware ordinal BCE", ("densenet121_class_aware", "resnet50_class_aware")),
+        ("Training variant: DenseNet121", ("densenet121_class_aware", "densenet121")),
+        ("Training variant: ResNet50", ("resnet50_class_aware", "resnet50")),
+    ]
+    available_pairs = [(label, models) for label, models in possible_pairs if set(models).issubset(model_sets)]
+    if not available_pairs:
+        st.info("Load a compatible pair of model CSV files to enable paired model comparisons.")
     else:
-        architecture_mode = st.radio(
-            "Architecture comparison mode",
-            ["Primary: all paired samples", "Sensitivity: same predicted KL target"],
-            horizontal=True,
-        )
-        sensitivity_mode = architecture_mode.startswith("Sensitivity")
-        architecture_pairs = (
-            architecture_same_target_pairs if sensitivity_mode else architecture_primary_pairs
-        )
-        architecture_values = architecture_comparison_values(architecture_pairs)
-        architecture_summary = architecture_comparison_analysis(architecture_pairs)
-        if sensitivity_mode:
-            st.warning(
-                "Sensitivity analysis: only images for which DenseNet121 and ResNet50 predicted the same KL class are retained. "
-                "This reduces confounding from different XAI target classes, but analyses a smaller selected cohort."
+        comparison_name = st.selectbox("Model comparison", [label for label, _ in available_pairs])
+        selected_pair = next(models for label, models in available_pairs if label == comparison_name)
+        try:
+            architecture_primary_pairs = architecture_complete_case_pairs(results, models=selected_pair)
+            architecture_same_target_pairs = architecture_complete_case_pairs(
+                results, same_target_only=True, models=selected_pair
             )
-        else:
-            st.caption(
-                "Primary analysis includes every complete finite pair, even when the two models predicted different KL classes."
+        except ResearchAnalysisError as exc:
+            st.info(f"Paired model comparison is unavailable: {exc}")
+            architecture_primary_pairs = None
+        if architecture_primary_pairs is not None:
+            architecture_mode = st.radio(
+                "Paired model comparison mode",
+                ["Primary: all paired samples", "Sensitivity: same predicted KL target"],
+                horizontal=True,
             )
-
-        architecture_tabs = st.tabs(list(METHOD_COMPARISON_METRICS))
-        for tab, metric_name in zip(architecture_tabs, METHOD_COMPARISON_METRICS):
-            with tab:
-                st.caption(_method_metric_caption(metric_name))
-                metric_values = architecture_values[architecture_values["Metric"].eq(metric_name)]
-                if metric_values.empty:
-                    st.info("No complete architecture pairs are available for this metric.")
-                    continue
-                st.altair_chart(
-                    _architecture_comparison_chart(architecture_values, architecture_summary, metric_name),
-                    use_container_width=True,
+            sensitivity_mode = architecture_mode.startswith("Sensitivity")
+            architecture_pairs = (
+                architecture_same_target_pairs if sensitivity_mode else architecture_primary_pairs
+            )
+            architecture_values = architecture_comparison_values(architecture_pairs)
+            architecture_summary = architecture_comparison_analysis(architecture_pairs)
+            if sensitivity_mode:
+                st.warning(
+                    "Sensitivity analysis: only images for which both models predicted the same KL class are retained. "
+                    "This reduces confounding from different XAI target classes, but analyses a smaller selected cohort."
                 )
-                metric_summary = architecture_summary[architecture_summary["Metric"].eq(metric_name)]
-                st.dataframe(_format_results_analysis_table(metric_summary), use_container_width=True, hide_index=True)
+            else:
+                st.caption(
+                    "Primary analysis includes every complete finite pair, even when the two models predicted different KL classes."
+                )
 
-        with st.expander("Architecture-comparison Wilcoxon statistics"):
-            st.caption(
-                "One two-sided paired Wilcoxon signed-rank test is calculated per XAI method × metric. "
-                "Holm correction is applied across all 25 architecture-comparison tests. Positive median paired differences "
-                "and rank-biserial correlations mean higher DenseNet121 values (DenseNet121 − ResNet50)."
-            )
-            st.dataframe(_format_results_analysis_table(architecture_summary), use_container_width=True, hide_index=True)
-            suffix = "same_target" if sensitivity_mode else "all_pairs"
-            st.download_button(
-                "Download architecture-comparison CSV",
-                data=architecture_summary.to_csv(index=False).encode("utf-8"),
-                file_name=f"architecture_comparison_{suffix}.csv",
-                mime="text/csv",
-            )
+            architecture_tabs = st.tabs(list(METHOD_COMPARISON_METRICS))
+            for tab, metric_name in zip(architecture_tabs, METHOD_COMPARISON_METRICS):
+                with tab:
+                    st.caption(_method_metric_caption(metric_name))
+                    metric_values = architecture_values[architecture_values["Metric"].eq(metric_name)]
+                    if metric_values.empty:
+                        st.info("No complete paired values are available for this metric.")
+                        continue
+                    st.altair_chart(
+                        _architecture_comparison_chart(architecture_values, architecture_summary, metric_name),
+                        use_container_width=True,
+                    )
+                    metric_summary = architecture_summary[architecture_summary["Metric"].eq(metric_name)]
+                    st.dataframe(_format_results_analysis_table(metric_summary), use_container_width=True, hide_index=True)
+
+            with st.expander("Paired-model Wilcoxon statistics"):
+                st.caption(
+                    "One two-sided paired Wilcoxon signed-rank test is calculated per XAI method × metric. "
+                    "Holm correction is applied across 25 tests for the selected model pair. "
+                    f"Positive paired effects mean higher values for {selected_pair[0]} than {selected_pair[1]}."
+                )
+                st.dataframe(_format_results_analysis_table(architecture_summary), use_container_width=True, hide_index=True)
+                suffix = "same_target" if sensitivity_mode else "all_pairs"
+                st.download_button(
+                    "Download paired-model comparison CSV",
+                    data=architecture_summary.to_csv(index=False).encode("utf-8"),
+                    file_name=f"model_comparison_{selected_pair[0]}_vs_{selected_pair[1]}_{suffix}.csv",
+                    mime="text/csv",
+                )
 
     st.markdown("#### Prediction correctness analysis")
     st.caption(
@@ -998,7 +1056,7 @@ def _show_results_analysis(results: pd.DataFrame) -> None:
     )
     try:
         correctness_values = prediction_correctness_values(results)
-        correctness_summary = prediction_correctness_analysis(results)
+        correctness_summary = _cached_prediction_correctness_analysis(results)
     except ResearchAnalysisError as exc:
         st.info(f"Prediction correctness analysis is unavailable: {exc}")
     else:

@@ -21,13 +21,20 @@ metric_name, metric_category, metric_value
 
 `run_id`, `split`, `seed`, `checkpoint_version`, and `target_class` may be included. When present, `target_class` must equal `predicted_kl`, because the current analysis explains the model prediction.
 
+Final-study rows also store `model_id` (equal to `model_name`),
+`model_architecture`, `training_variant`, `kl1_loss_multiplier`,
+`experiment_profile`, and SHA-256
+digests for the manifest, selected image contents, checkpoint and ONNX model.
+A matching `.csv.run.json` sidecar records the full run identity and package
+versions. Resume rejects a different identity; partial CSV writes are atomic.
+
 New pipeline outputs also include `metric_source` (`quantus` or `custom`), `score_direction` (`lower` or `higher`), and `metric_parameters` (a JSON object). These make values reproducible and interpretable. Older CSV files remain valid but are shown as legacy data because they do not retain the metric configuration.
 
 `metric_status` is `ok` for a usable numeric value. It can be `undefined_zero_perturbed_attribution` only for `MaxSensitivity`: Quantus encountered an all-zero explanation after its prescribed input perturbation and therefore did not define a score. Such a row has an empty `metric_value` and a `metric_note`; Research Mode excludes it from numerical summaries while showing the exclusion count. It is not replaced with an artificial epsilon value.
 
-New runs use `FaithfulnessCorrelation` as the primary faithfulness metric. It ranges from -1 to 1, where higher is better, and uses a recorded, normalised attribution protocol. `Infidelity` may appear in older files only and is treated as legacy data. `MaxSensitivity` is lower-is-better; `Sparseness` is higher for more concentrated maps, not necessarily clinically better. Deletion confidence drop is displayed under Faithfulness and stability score under Robustness; both remain custom implementations. The `Custom checks` dashboard tab is intentionally empty until a future dataset-wide agreement metric is generated.
+New runs use `FaithfulnessCorrelation` as the primary faithfulness metric. It ranges from -1 to 1, where higher is better, and uses the project's custom spatial RGB-grouped implementation of the Quantus correlation principle (`metric_source=custom`). Old CSVs retain their original source labels. `Infidelity` is legacy only. `MaxSensitivity` is lower-is-better; `Sparseness` describes concentration, not clinical quality. Legacy Deletion confidence drop and current Stability score remain supporting custom checks.
 
-For the final ordinal-BCE ResNet-50 and DenseNet-121 models, `target_class` is decoded by counting threshold probabilities above 0.5. Class-dependent XAI and Quantus evaluate the differentiable score of that original predicted KL class, recorded as `xai_target: predicted_kl_class_score`; image masking never changes the target class being evaluated.
+For ordinal ResNet-50 and DenseNet-121 model variants, `target_class` is decoded by counting threshold probabilities above 0.5. Class-dependent XAI and evaluation use a differentiable score of the original predicted KL class. Eigen-CAM itself is class-agnostic; its metric evaluation still uses the predicted-class score. New rows record this distinction as `xai_map_target`.
 
 The offline runner verifies ONNX and PyTorch ordinal logits before evaluation. It stops for a material logit disagreement, which can indicate mismatched model files. A sign change is accepted only when it is within a documented near-zero numerical margin; in that case the runner warns and XAI still targets the ONNX KL prediction saved in the CSV.
 

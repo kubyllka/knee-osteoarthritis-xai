@@ -105,11 +105,21 @@ def export_to_onnx(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Export trained KL Grade classifier to ONNX.")
+    parser.add_argument("--model-id", choices=sorted(MODEL_CONFIGS), default=None,
+                        help="Use the configured architecture, checkpoint, output path, and output type.")
     parser.add_argument("--architecture", choices=["vit", "resnet50", "densenet121"], default="vit")
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--num-classes", type=int, default=NUM_CLASSES)
     args = parser.parse_args()
+
+    if args.model_id is not None:
+        config = MODEL_CONFIGS[args.model_id]
+        args.architecture = config.get("architecture", args.model_id)
+        args.checkpoint = args.checkpoint or config["checkpoint_path"]
+        args.output = args.output or config["onnx_path"]
+        args.output_type = config.get("output_type", "multiclass")
+        return args
 
     if args.checkpoint is None:
         args.checkpoint = {
@@ -124,10 +134,11 @@ def parse_args():
             "densenet121": DENSENET_ONNX_MODEL_PATH,
         }[args.architecture]
 
+    args.output_type = MODEL_CONFIGS.get(args.architecture, {}).get("output_type", "multiclass")
+
     return args
 
 
 if __name__ == "__main__":
     args = parse_args()
-    output_type = MODEL_CONFIGS.get(args.architecture, {}).get("output_type", "multiclass")
-    export_to_onnx(args.checkpoint, args.output, args.num_classes, args.architecture, output_type)
+    export_to_onnx(args.checkpoint, args.output, args.num_classes, args.architecture, args.output_type)

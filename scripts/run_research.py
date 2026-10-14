@@ -13,7 +13,7 @@ from PIL import Image
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.config import MODEL_CONFIGS
+from app.config import MODEL_CONFIGS, RESEARCH_MODEL_IDS
 from app.evaluation import build_stability_metrics
 from app.metric_registry import metric_definition, parse_parameters, serialise_parameters
 from app.inference import ONNXKneeOsteoarthritisClassifier
@@ -24,7 +24,16 @@ from app.quantus_metrics import (
     evaluate_quantus_metrics,
     random_order_region_control,
 )
-from app.research.manifest import DatasetSample, load_dataset_manifest
+from app.research.experiment import FINAL_RESEARCH_PROFILE
+from app.research.manifest import DatasetSample, load_dataset_manifest, validate_final_test_manifest
+from app.research.run_metadata import (
+    ensure_matching_metadata,
+    metadata_path,
+    package_versions,
+    sample_content_digest,
+    sha256_file,
+    write_dataframe_atomic,
+)
 from app.research.results import load_research_results, validate_research_results
 from app.xai import generate_xai_visualization, load_xai_model_by_name, predict_kl_with_xai_model, preprocess_pil_for_torch
 
@@ -276,7 +285,8 @@ def custom_metric_rows(
             checkpoint_version,
             stability_definition.source,
             stability_definition.score_direction,
-            {"brightness_multiplier": 1.05, "contrast_multiplier": 1.05, "device": device_name, **ordinal_parameters},
+            {"brightness_multiplier": 1.05, "contrast_multiplier": 1.05,
+             "device": device_name, **ordinal_parameters},
             attribution_diagnostics=diagnostics,
         ),
     ]
@@ -307,7 +317,7 @@ def quantus_metric_rows(
             run_id,
             seed,
             checkpoint_version,
-            "quantus",
+            metric_definition(score.metric_name).source,
             score.score_direction,
             {**score.parameters, "device": device_name},
             score.status,
@@ -368,12 +378,12 @@ def _validate_resume_configuration(
 
     # All other fields are fixed by this pipeline version. Multiple parameter
     # objects for a metric would mean an interrupted file mixed experiments.
-    for metric_name, metric_rows in existing.groupby("metric_name"):
+    for (metric_name, method), metric_rows in existing.groupby(["metric_name", "xai_method"]):
         parameter_texts = set(metric_rows.get("metric_parameters", pd.Series(dtype="object")).dropna().astype(str))
         if not parameter_texts:
-            raise ValueError(f"Cannot resume: {metric_name} has no stored metric configuration.")
+            raise ValueError(f"Cannot resume: {metric_name}/{method} has no stored metric configuration.")
         if len(parameter_texts) != 1:
-            raise ValueError(f"Cannot resume: {metric_name} contains mixed metric configurations.")
+            raise ValueError(f"Cannot resume: {metric_name}/{method} contains mixed metric configurations.")
         parameters = parse_parameters(next(iter(parameter_texts)))
         if parameters is None or parameters.get("device") != device_name:
             raise ValueError(f"Cannot resume: {metric_name} was created with a different or unreadable device configuration.")
@@ -395,17 +405,21 @@ def completed_combinations_for_metrics(
     return completed
 
 
-def _write_validated_rows(rows: list[dict], output_path: Path) -> pd.DataFrame:
+def _write_validated_rows(rows: list[dict], output_path: Path, metadata_fields: dict | None = None) -> pd.DataFrame:
     results = validate_research_results(pd.DataFrame(rows))
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    results.to_csv(output_path, index=False)
+    results["xai_map_target"] = np.where(
+        results["xai_method"].eq("Eigen-CAM"), "class_agnostic", "predicted_kl"
+    )
+    if metadata_fields:
+        for key, value in metadata_fields.items():
+            results[key] = value
+    write_dataframe_atomic(results, output_path)
     return results
 
 
 def _write_random_control_rows(rows: list[dict], output_path: Path) -> pd.DataFrame:
     frame = pd.DataFrame(rows)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(output_path, index=False)
+    write_dataframe_atomic(frame, output_path)
     return frame
 
 
@@ -449,6 +463,53 @@ def _validate_random_control_resume(
             raise ValueError("Cannot resume random control: existing output has incompatible seeds.")
 
 
+def build_run_metadata(
+    *, manifest_path: Path, samples: list[DatasetSample], model_name: str,
+    model_config: dict, run_id: str, seed: int, methods: list[str],
+    metrics: frozenset[str], device_name: str, faithfulness_runs: int,
+    faithfulness_subset_size: int, max_sensitivity_samples: int,
+    max_sensitivity_normalise: bool, profile_name: str | None,
+    random_control_enabled: bool, random_control_repeats: int,
+) -> dict:
+    """Freeze the exact model, image contents, and method/metric configuration."""
+    return {
+        "schema_version": 1,
+        "run_id": run_id,
+        "model_id": model_name,
+        "architecture": model_config.get("architecture", model_name),
+        "training_variant": model_config.get("training_variant", "legacy"),
+        "kl1_loss_multiplier": model_config.get("kl1_loss_multiplier"),
+        "checkpoint_filename": model_config["checkpoint_path"].name,
+        "checkpoint_sha256": sha256_file(model_config["checkpoint_path"]),
+        "onnx_filename": model_config["onnx_path"].name,
+        "onnx_sha256": sha256_file(model_config["onnx_path"]),
+        "manifest_sha256": sha256_file(manifest_path),
+        "selected_sample_content_sha256": sample_content_digest(samples),
+        "selected_sample_count": len(samples),
+        "seed": seed,
+        "methods": list(methods),
+        "metrics": sorted(metrics),
+        "device": device_name,
+        "profile": profile_name or "custom",
+        "faithfulness_runs": faithfulness_runs,
+        "faithfulness_subset_size": faithfulness_subset_size,
+        "max_sensitivity_samples": max_sensitivity_samples,
+        "max_sensitivity_normalise": max_sensitivity_normalise,
+        "random_control_enabled": random_control_enabled,
+        "random_control_repeats": random_control_repeats if random_control_enabled else None,
+        "xai_and_metric_settings": FINAL_RESEARCH_PROFILE.metadata() if profile_name == "final_research" else None,
+        "implementation_sha256": {
+            relative: sha256_file(PROJECT_ROOT / relative)
+            for relative in (
+                "app/preprocessing.py", "app/inference.py", "app/ordinal.py",
+                "app/xai.py", "app/quantus_metrics.py", "app/evaluation.py",
+                "app/research/experiment.py", "scripts/run_research.py",
+            )
+        },
+        "package_versions": package_versions(),
+    }
+
+
 def run_research(
     manifest_path: Path,
     model_name: str,
@@ -467,6 +528,7 @@ def run_research(
     metrics: set[str] | frozenset[str] | None = None,
     random_control_output: Path | None = None,
     random_control_repeats: int = 1,
+    profile_name: str | None = None,
 ) -> pd.DataFrame:
     set_research_seed(seed)
     selected_device = resolve_device(device)
@@ -475,13 +537,70 @@ def run_research(
     unknown_metrics = selected_metrics - RUNNER_METRICS
     if unknown_metrics:
         raise ValueError("Unsupported research metrics: " + ", ".join(sorted(unknown_metrics)))
+    if profile_name is not None:
+        if profile_name != "final_research":
+            raise ValueError(f"Unsupported research profile: {profile_name}")
+        profile = FINAL_RESEARCH_PROFILE
+        if (
+            tuple(methods) != profile.methods
+            or selected_metrics != frozenset(profile.metrics)
+            or faithfulness_runs != profile.faithfulness_runs
+            or faithfulness_subset_size != profile.faithfulness_subset_size
+            or max_sensitivity_samples != profile.max_sensitivity_samples
+            or max_sensitivity_normalise != profile.max_sensitivity_normalise
+        ):
+            raise ValueError("final_research settings differ from the shared fixed profile.")
     if random_control_output is not None and random_control_output.resolve() == output_path.resolve():
         raise ValueError("The random-control output must be different from the main research output.")
     samples = select_manifest_samples(load_dataset_manifest(manifest_path), limit, samples_per_kl)
     if not samples:
         raise ValueError("No samples selected for the research run.")
+    if profile_name == "final_research":
+        full_cohort = limit is None and (samples_per_kl is None or samples_per_kl == 50)
+        if device_name != "cuda" and full_cohort:
+            raise RuntimeError("The full final_research run requires CUDA; use --device cuda on a GPU host.")
+        if full_cohort:
+            originals = load_dataset_manifest(PROJECT_ROOT / "inputs/test/test_manifest.json")
+            validate_final_test_manifest(samples, originals)
+        if (REGION_PERTURBATION_PATCH_SIZE, REGION_PERTURBATION_REGIONS) != (
+            FINAL_RESEARCH_PROFILE.region_patch_size, FINAL_RESEARCH_PROFILE.region_count
+        ):
+            raise RuntimeError("Region Perturbation implementation no longer matches final_research profile.")
 
     model_config = MODEL_CONFIGS[model_name]
+    for name in ("checkpoint_path", "onnx_path"):
+        if not model_config[name].is_file():
+            raise FileNotFoundError(
+                f"{model_name}: required {name} is missing: {model_config[name]}. "
+                "Place the trusted model file locally or export ONNX from its matching checkpoint."
+            )
+    run_metadata = build_run_metadata(
+        manifest_path=manifest_path, samples=samples, model_name=model_name,
+        model_config=model_config, run_id=run_id, seed=seed, methods=methods,
+        metrics=selected_metrics, device_name=device_name,
+        faithfulness_runs=faithfulness_runs,
+        faithfulness_subset_size=faithfulness_subset_size,
+        max_sensitivity_samples=max_sensitivity_samples,
+        max_sensitivity_normalise=max_sensitivity_normalise,
+        profile_name=profile_name,
+        random_control_enabled=random_control_output is not None,
+        random_control_repeats=random_control_repeats,
+    )
+    if output_path.exists() and resume and not metadata_path(output_path).exists() and profile_name is None:
+        print("Warning: resuming a legacy CSV without a run-metadata sidecar; only row-level checks are available.")
+    else:
+        ensure_matching_metadata(output_path, run_metadata, resume=resume)
+    metadata_fields = {
+        "model_id": model_name,
+        "experiment_profile": run_metadata["profile"],
+        "model_architecture": run_metadata["architecture"],
+        "training_variant": run_metadata["training_variant"],
+        "kl1_loss_multiplier": run_metadata["kl1_loss_multiplier"],
+        "manifest_sha256": run_metadata["manifest_sha256"],
+        "selected_sample_content_sha256": run_metadata["selected_sample_content_sha256"],
+        "checkpoint_sha256": run_metadata["checkpoint_sha256"],
+        "onnx_sha256": run_metadata["onnx_sha256"],
+    }
     classifier = ONNXKneeOsteoarthritisClassifier(
         model_config["onnx_path"], output_type=model_config.get("output_type", "multiclass")
     )
@@ -672,34 +791,37 @@ def run_research(
                         device_name,
                     )
                 )
-            _write_validated_rows(rows, output_path)
+            _write_validated_rows(rows, output_path, metadata_fields)
             complete_pairs.add(pair)
 
-    return _write_validated_rows(rows, output_path)
+    return _write_validated_rows(rows, output_path, metadata_fields)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run offline XAI evaluation and write Research Mode results.")
     parser.add_argument("--manifest", type=Path, default=PROJECT_ROOT / "inputs" / "manifest.json")
     parser.add_argument("--model", choices=sorted(MODEL_CONFIGS), default="resnet50")
-    parser.add_argument("--methods", nargs="+", default=DEFAULT_METHODS)
+    parser.add_argument("--all-models", action="store_true", help="Run all four ordinal model IDs sequentially.")
+    parser.add_argument("--profile", choices=["final_research"], default=None)
+    parser.add_argument("--methods", nargs="+", default=None)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "results" / "research")
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--samples-per-kl", type=int, default=None)
-    parser.add_argument("--faithfulness-runs", type=int, default=50)
+    parser.add_argument("--faithfulness-runs", type=int, default=None)
     parser.add_argument(
         "--faithfulness-subset-size",
         type=int,
-        default=224,
+        default=None,
         help="Number of spatial RGB pixel groups perturbed per FaithfulnessCorrelation run.",
     )
-    parser.add_argument("--max-sensitivity-samples", type=int, default=8)
+    parser.add_argument("--max-sensitivity-samples", type=int, default=None)
     parser.add_argument(
         "--max-sensitivity-normalise",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help=(
             "Normalise the original and every perturbed attribution independently by their "
             "maximum absolute value inside Quantus MaxSensitivity."
@@ -709,7 +831,7 @@ def parse_args():
         "--metrics",
         nargs="+",
         choices=sorted(METRIC_KEYS),
-        default=list(METRIC_KEYS),
+        default=None,
         help="Metrics to calculate. Use metric keys such as faithfulness-correlation or region-perturbation.",
     )
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
@@ -722,6 +844,39 @@ def parse_args():
     )
     parser.add_argument("--random-control-repeats", type=int, default=1)
     args = parser.parse_args()
+
+    if args.profile == "final_research":
+        profile = FINAL_RESEARCH_PROFILE
+        profile_values = {
+            "methods": list(profile.methods),
+            "faithfulness_runs": profile.faithfulness_runs,
+            "faithfulness_subset_size": profile.faithfulness_subset_size,
+            "max_sensitivity_samples": profile.max_sensitivity_samples,
+            "max_sensitivity_normalise": profile.max_sensitivity_normalise,
+        }
+        for name, expected in profile_values.items():
+            actual = getattr(args, name)
+            if actual is not None and actual != expected:
+                parser.error(f"--profile final_research fixes {name} to {expected}; do not override it")
+            setattr(args, name, expected)
+        final_metric_keys = [key for key, name in METRIC_KEYS.items() if name in profile.metrics]
+        if args.metrics is not None and set(args.metrics) != set(final_metric_keys):
+            parser.error("--profile final_research requires all five fixed metrics")
+        args.metrics = final_metric_keys
+    else:
+        args.methods = args.methods or DEFAULT_METHODS
+        args.metrics = args.metrics or list(METRIC_KEYS)
+        args.faithfulness_runs = args.faithfulness_runs if args.faithfulness_runs is not None else 50
+        args.faithfulness_subset_size = args.faithfulness_subset_size if args.faithfulness_subset_size is not None else 224
+        args.max_sensitivity_samples = args.max_sensitivity_samples if args.max_sensitivity_samples is not None else 8
+        args.max_sensitivity_normalise = (
+            args.max_sensitivity_normalise if args.max_sensitivity_normalise is not None else False
+        )
+
+    if args.all_models and args.output is not None:
+        parser.error("--all-models creates one CSV per model; use --output-dir, not --output")
+    if args.all_models and args.random_control_output is not None:
+        parser.error("--all-models requires separate random-control outputs; run models individually for that control")
 
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
@@ -740,30 +895,40 @@ def parse_args():
 
     if args.run_id is None:
         args.run_id = datetime.now().strftime("research-%Y%m%d-%H%M%S")
-    if args.output is None:
-        args.output = PROJECT_ROOT / "results" / "research" / f"{args.run_id}.csv"
+    if args.output is None and not args.all_models:
+        args.output = args.output_dir / f"{args.run_id}.csv"
     return args
 
 
 if __name__ == "__main__":
     arguments = parse_args()
-    dataframe = run_research(
-        manifest_path=arguments.manifest,
-        model_name=arguments.model,
-        methods=arguments.methods,
-        output_path=arguments.output,
-        run_id=arguments.run_id,
-        seed=arguments.seed,
-        limit=arguments.limit,
-        samples_per_kl=arguments.samples_per_kl,
-        faithfulness_runs=arguments.faithfulness_runs,
-        faithfulness_subset_size=arguments.faithfulness_subset_size,
-        max_sensitivity_samples=arguments.max_sensitivity_samples,
-        max_sensitivity_normalise=arguments.max_sensitivity_normalise,
-        device=arguments.device,
-        resume=arguments.resume,
-        metrics={METRIC_KEYS[key] for key in arguments.metrics},
-        random_control_output=arguments.random_control_output,
-        random_control_repeats=arguments.random_control_repeats,
-    )
-    print(f"Saved {len(dataframe)} metric rows to: {arguments.output}")
+    model_ids = RESEARCH_MODEL_IDS if arguments.all_models else (arguments.model,)
+    for model_id in model_ids:
+        config = MODEL_CONFIGS[model_id]
+        for key in ("checkpoint_path", "onnx_path"):
+            if not config[key].is_file():
+                raise FileNotFoundError(f"{model_id}: missing {key}: {config[key]}")
+    for model_id in model_ids:
+        run_id = f"{arguments.run_id}-{model_id}" if arguments.all_models else arguments.run_id
+        output_path = arguments.output_dir / f"{run_id}.csv" if arguments.all_models else arguments.output
+        dataframe = run_research(
+            manifest_path=arguments.manifest,
+            model_name=model_id,
+            methods=arguments.methods,
+            output_path=output_path,
+            run_id=run_id,
+            seed=arguments.seed,
+            limit=arguments.limit,
+            samples_per_kl=arguments.samples_per_kl,
+            faithfulness_runs=arguments.faithfulness_runs,
+            faithfulness_subset_size=arguments.faithfulness_subset_size,
+            max_sensitivity_samples=arguments.max_sensitivity_samples,
+            max_sensitivity_normalise=arguments.max_sensitivity_normalise,
+            device=arguments.device,
+            resume=arguments.resume,
+            metrics={METRIC_KEYS[key] for key in arguments.metrics},
+            random_control_output=arguments.random_control_output,
+            random_control_repeats=arguments.random_control_repeats,
+            profile_name=arguments.profile,
+        )
+        print(f"Saved {len(dataframe)} metric rows to: {output_path}")

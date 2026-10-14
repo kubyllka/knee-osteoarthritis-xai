@@ -22,7 +22,7 @@ METRIC_REGISTRY: dict[str, MetricDefinition] = {
         description="Correlation between attribution importance and model-output changes after feature perturbations.",
         interpretation="Higher values indicate better relative faithfulness. Scores range from -1 to 1.",
         display_format="{:.3f}",
-        source="quantus",
+        source="custom",
     ),
     "Infidelity": MetricDefinition(
         category="faithfulness",
