@@ -2,6 +2,7 @@ from io import BytesIO
 import json
 from pathlib import Path
 import random
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import altair as alt
 import numpy as np
@@ -1568,6 +1569,51 @@ def show_research_mode() -> None:
         st.error(f"{section} is unavailable for this cohort: {exc}")
 
 
+def _xai_gallery_images_zip(results: list) -> bytes:
+    """Export the original and overlays as separate, unscaled PNG files."""
+    archive = BytesIO()
+    images = [("01_original_xray.png", results[0].original)]
+    for index, result in enumerate(results, start=2):
+        method_slug = result.method.lower().replace("+", "plus").replace("-", "_").replace(" ", "_")
+        images.append((f"{index:02d}_{method_slug}_overlay.png", result.overlay))
+    with ZipFile(archive, "w", compression=ZIP_DEFLATED) as bundle:
+        for filename, image in images:
+            png = BytesIO()
+            image.save(png, format="PNG")
+            bundle.writestr(filename, png.getvalue())
+    return archive.getvalue()
+
+
+@st.fragment
+def _show_xai_gallery_download(results: list) -> None:
+    st.download_button(
+        "Download images for a report (.zip)",
+        data=_xai_gallery_images_zip(results),
+        file_name="kneexai_explanation_images.zip",
+        mime="application/zip",
+        key="download-xai-gallery-images",
+    )
+
+
+def _show_overlay_gallery(results: list) -> None:
+    """Show original plus selected overlays in fixed three-column rows."""
+    st.markdown("#### Overlay comparison")
+    st.caption("Original radiograph and the overlays from the selected methods, shown at the same size.")
+    gallery_items = [("Original X-ray", results[0].original)] + [
+        (result.method, result.overlay) for result in results
+    ]
+    with st.container(key="overlay-gallery"):
+        for offset in range(0, len(gallery_items), 3):
+            comparison_cols = st.columns(3, gap="small")
+            for column, (label, visual) in zip(comparison_cols, gallery_items[offset:offset + 3]):
+                with column:
+                    # Display-only enlargement avoids tiny native-size images in wide columns.
+                    preview = visual.resize((672, 672), Image.Resampling.LANCZOS)
+                    st.image(preview, use_container_width=True)
+                    st.caption(label)
+    _show_xai_gallery_download(results)
+
+
 def show_xai(
     image: Image.Image,
     prediction: dict,
@@ -1620,15 +1666,7 @@ def show_xai(
                         st.image(visual, use_container_width=True)
 
     if len(results) > 1:
-        st.markdown("#### Overlay comparison")
-        with st.container(key="overlay-gallery"):
-            for offset in range(0, len(results), 3):
-                comparison_cols = st.columns(min(3, len(results) - offset), gap="small")
-                for column, result in zip(comparison_cols, results[offset:offset + 3]):
-                    with column:
-                        with st.container(border=True):
-                            st.caption(result.method)
-                            st.image(result.overlay, use_container_width=True)
+        _show_overlay_gallery(results)
 
         pair_metrics, similarity_matrix, average_score = build_xai_metrics(results)
 
