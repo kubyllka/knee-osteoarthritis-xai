@@ -3,3 +3,10 @@
 # watcher may inspect it as a filesystem path and emit a misleading error.
 # Disable automatic source watching; restart Streamlit after code changes.
 fileWatcherType = "none"
+
+[theme]
+primaryColor = "#2563EB"
+backgroundColor = "#F8FAFC"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#17253E"
+font = "sans serif"

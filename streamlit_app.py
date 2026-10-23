@@ -16,9 +16,6 @@ from app.evaluation import (
     build_deletion_metrics,
     build_stability_metrics,
     build_xai_metrics,
-    interpret_agreement,
-    interpret_deletion,
-    interpret_stability,
 )
 from app.inference import ONNXKneeOsteoarthritisClassifier
 from app.metric_registry import is_legacy_metric, metric_definition, parse_parameters
@@ -76,6 +73,51 @@ PRIMARY_KL_METRIC_ORDER = [
 KL_GRADE_LABELS = [f"KL{grade}" for grade in range(5)]
 
 
+def apply_interface_styles() -> None:
+    """Small, presentation-only styles; model and metric outputs are untouched."""
+    st.markdown(
+        """
+        <style>
+            .kneexai-brand {
+                color: #17253E;
+                font-size: 1.7rem;
+                font-weight: 700;
+                letter-spacing: -0.025em;
+                line-height: 1.2;
+                margin: 0 0 0.2rem;
+            }
+            .kneexai-subtitle {
+                color: #475569;
+                font-size: 0.98rem;
+                margin: 0 0 0.55rem;
+            }
+            .kneexai-grade {
+                color: #17253E;
+                font-size: clamp(1.8rem, 3vw, 2.35rem);
+                font-weight: 700;
+                letter-spacing: -0.035em;
+                line-height: 1.15;
+                margin: 0 0 0.35rem;
+            }
+            .st-key-prediction-view img {
+                max-height: 320px;
+                object-fit: contain;
+            }
+            .st-key-prediction-view h2 {
+                color: #17253E;
+                font-size: 1.3rem;
+                letter-spacing: -0.015em;
+            }
+            @media (max-width: 640px) {
+                .kneexai-brand { font-size: 1.45rem; }
+                .st-key-prediction-view img { max-height: 240px; }
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 @st.cache_resource
 def get_local_classifier(model_name: str) -> ONNXKneeOsteoarthritisClassifier:
     config = MODEL_CONFIGS[model_name]
@@ -118,21 +160,23 @@ def show_prediction(prediction: dict) -> None:
     grade = int(prediction["grade"])
     confidence = float(prediction["confidence"])
 
-    st.subheader(f"Predicted class: Grade {grade}")
-    st.write(f"**Meaning:** {GRADE_MEANINGS.get(grade, KL_LABELS.get(grade, 'Unknown grade'))}")
+    st.caption("PREDICTED SEVERITY")
+    st.markdown(f'<div class="kneexai-grade">KL Grade {grade}</div>', unsafe_allow_html=True)
+    st.write(GRADE_MEANINGS.get(grade, KL_LABELS.get(grade, "Unknown grade")))
 
     metric_cols = st.columns(2)
     metric_cols[0].metric("Confidence", format_percent(confidence))
-    metric_cols[1].metric("Latency", f"{float(prediction.get('latency_ms', 0.0)):.1f} ms")
+    metric_cols[1].metric("Inference time", f"{float(prediction.get('latency_ms', 0.0)):.1f} ms")
 
     probabilities = prediction["probabilities"]
     chart_data = pd.DataFrame(
         {
-            "Grade": [label.replace("KL Grade ", "Grade ") for label in probabilities],
+            "Grade": [label.replace("KL Grade ", "KL") for label in probabilities],
             "Probability": [float(probability) for probability in probabilities.values()],
         }
     )
-    st.bar_chart(chart_data, x="Grade", y="Probability", height=280)
+    st.caption("Class scores · KL0–KL4")
+    st.bar_chart(chart_data, x="Grade", y="Probability", color="#2563EB", height=220)
 
 
 def all_option(values) -> list[str]:
@@ -1337,60 +1381,72 @@ def show_xai(
                 )
             )
 
-    st.subheader("Explainable AI visualizations")
+    st.subheader("Model Explainability")
+    st.caption("Compare the original radiograph with each method's heatmap and overlay.")
 
     tabs = st.tabs([result.method for result in results])
     for tab, result in zip(tabs, results):
         with tab:
-            xai_cols = st.columns(3)
-            xai_cols[0].image(result.original, caption="Original X-ray", use_container_width=True)
-            xai_cols[1].image(result.heatmap, caption=f"{result.method} heatmap", use_container_width=True)
-            xai_cols[2].image(result.overlay, caption=f"{result.method} overlay", use_container_width=True)
+            xai_cols = st.columns(3, gap="small")
+            for column, label, visual in zip(
+                xai_cols,
+                ("Original X-ray", "XAI Heatmap", "Overlay"),
+                (result.original, result.heatmap, result.overlay),
+            ):
+                with column:
+                    with st.container(border=True):
+                        st.caption(label)
+                        st.image(visual, use_container_width=True)
 
     if len(results) > 1:
-        st.subheader("Overlay comparison")
-        comparison_cols = st.columns(len(results))
-        for column, result in zip(comparison_cols, results):
-            column.image(result.overlay, caption=result.method, use_container_width=True)
+        st.markdown("#### Overlay comparison")
+        with st.container(key="overlay-gallery"):
+            for offset in range(0, len(results), 3):
+                comparison_cols = st.columns(min(3, len(results) - offset), gap="small")
+                for column, result in zip(comparison_cols, results[offset:offset + 3]):
+                    with column:
+                        with st.container(border=True):
+                            st.caption(result.method)
+                            st.image(result.overlay, use_container_width=True)
 
         pair_metrics, similarity_matrix, average_score = build_xai_metrics(results)
 
-        st.subheader("Quantitative XAI comparison")
-        st.dataframe(pair_metrics.style.format({
-            "Pearson correlation": "{:.3f}",
-            "Top 20% IoU": "{:.3f}",
-            "Agreement score": "{:.3f}",
-        }), use_container_width=True, hide_index=True)
+    st.subheader("Explanation Analysis")
+    st.caption("Single-image checks describe different properties of the explanations; no one score establishes clinical validity.")
+    if len(results) > 1:
+        with st.container(border=True):
+            st.markdown("#### XAI Agreement")
+            st.metric("Average agreement score", f"{average_score:.3f}")
+            st.caption("Pairwise similarity of the maps, combining Pearson correlation and overlap of their top 20% regions.")
+            with st.expander("Pairwise results and similarity matrix"):
+                st.dataframe(pair_metrics.style.format({
+                    "Pearson correlation": "{:.3f}",
+                    "Top 20% IoU": "{:.3f}",
+                    "Agreement score": "{:.3f}",
+                }), use_container_width=True, hide_index=True)
+                st.dataframe(similarity_matrix.style.format("{:.3f}"), use_container_width=True)
 
-        st.metric("Average XAI Agreement Score", f"{average_score:.3f}")
-        st.write(interpret_agreement(average_score))
-
-        with st.expander("Heatmap similarity matrix"):
-            st.dataframe(
-                similarity_matrix.style.format("{:.3f}"),
-                use_container_width=True,
-            )
-
-    st.subheader("Deletion Check")
     deletion_metrics, average_drop = build_deletion_metrics(
         results,
         prediction,
         model_name=model_name,
         predict_fn=predict_locally,
     )
-    st.dataframe(
-        deletion_metrics.style.format({
-            "Original class confidence": "{:.3f}",
-            "After deletion confidence": "{:.3f}",
-            "Confidence drop": "{:.3f}",
-        }),
-        use_container_width=True,
-        hide_index=True,
-    )
-    st.metric("Average confidence drop after deleting top 20% XAI region", f"{average_drop:.3f}")
-    st.write(interpret_deletion(average_drop))
+    with st.container(border=True):
+        st.markdown("#### Deletion Check")
+        st.metric("Average confidence drop", f"{average_drop:.3f}")
+        st.caption("Change in predicted-class confidence after masking the top 20% highlighted region. It also depends on the original confidence.")
+        with st.expander("Per-method deletion results"):
+            st.dataframe(
+                deletion_metrics.style.format({
+                    "Original class confidence": "{:.3f}",
+                    "After deletion confidence": "{:.3f}",
+                    "Confidence drop": "{:.3f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
 
-    st.subheader("Stability Check")
     stability_metrics, average_stability = build_stability_metrics(
         model=model,
         image=image,
@@ -1398,20 +1454,23 @@ def show_xai(
         predicted_grade=int(prediction["grade"]),
         model_name=model_name,
     )
-    st.dataframe(
-        stability_metrics.style.format({
-            "Pearson correlation": "{:.3f}",
-            "Top 20% IoU": "{:.3f}",
-            "Stability score": "{:.3f}",
-        }),
-        use_container_width=True,
-        hide_index=True,
-    )
-    st.metric("Average Stability Score", f"{average_stability:.3f}")
-    st.write(interpret_stability(average_stability))
+    with st.container(border=True):
+        st.markdown("#### Stability Check")
+        st.metric("Average stability score", f"{average_stability:.3f}")
+        st.caption("Similarity of explanations before and after the existing mild brightness and contrast perturbation.")
+        with st.expander("Per-method stability results"):
+            st.dataframe(
+                stability_metrics.style.format({
+                    "Pearson correlation": "{:.3f}",
+                    "Top 20% IoU": "{:.3f}",
+                    "Stability score": "{:.3f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
 
-    st.subheader("Quantus evaluation (exploratory)")
-    st.caption("Runs only when requested. This quick profile uses 8 faithfulness runs and 2 sensitivity samples; it is not a dataset-level research result.")
+    st.subheader("Optional Quantus Evaluation")
+    st.caption("Optional exploratory evaluation for the selected image. Not a dataset-level research result. The quick profile uses 8 faithfulness runs and 2 sensitivity samples.")
     if st.button("Evaluate selected XAI methods", key=f"quantus-{model_name}-{','.join(methods)}"):
         random.seed(42)
         np.random.seed(42)
@@ -1470,58 +1529,72 @@ def main() -> None:
         layout="wide",
     )
 
-    st.title("KneeXAI: Explainable AI System for Osteoarthritis Severity Classification")
-    st.warning(DISCLAIMER)
+    apply_interface_styles()
+    st.markdown('<div class="kneexai-brand">KneeXAI</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="kneexai-subtitle">Knee Osteoarthritis Classification &amp; Explainability</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(DISCLAIMER)
 
-    mode = st.radio("Application mode", ["Prediction", "Research"], horizontal=True)
+    mode = st.segmented_control(
+        "Application mode", ["Prediction", "Research"], default="Prediction", label_visibility="collapsed"
+    )
     if mode == "Research":
         show_research_mode()
         return
 
     with st.sidebar:
         model_options = {config["display_name"]: name for name, config in MODEL_CONFIGS.items()}
-        st.header("Inference")
+        st.subheader("Main settings")
         selected_model_label = st.selectbox("Model", list(model_options.keys()))
         model_name = model_options[selected_model_label]
-        use_api = st.toggle("Use FastAPI endpoint", value=False)
-        api_url = st.text_input("FastAPI URL", value="http://127.0.0.1:8000")
-        st.header("Explainability")
         enable_xai = st.toggle("Show XAI visualization", value=True)
         methods = st.multiselect("XAI methods", XAI_METHODS, default=DEFAULT_XAI_METHODS)
         alpha = st.slider("Overlay strength", min_value=0.1, max_value=0.8, value=0.45, step=0.05)
+        with st.expander("Advanced settings"):
+            use_api = st.toggle("Use FastAPI endpoint", value=False)
+            api_url = st.text_input("FastAPI URL", value="http://127.0.0.1:8000")
 
-    uploaded_file = st.file_uploader(
-        "Upload a knee X-ray image",
-        type=["png", "jpg", "jpeg", "bmp", "webp"],
-    )
+    with st.container(key="prediction-view"):
+        st.subheader("Prediction Results")
+        uploaded_file = st.file_uploader(
+            "Upload a knee X-ray image",
+            type=["png", "jpg", "jpeg", "bmp", "webp"],
+        )
 
-    if uploaded_file is None:
-        st.info("Upload an X-ray image to start prediction.")
-        return
+        if uploaded_file is None:
+            st.info("Upload an X-ray image to start prediction.")
+            return
 
-    image_bytes = uploaded_file.getvalue()
-    image = Image.open(BytesIO(image_bytes)).convert("RGB")
+        image_bytes = uploaded_file.getvalue()
+        image = Image.open(BytesIO(image_bytes)).convert("RGB")
 
-    image_col, result_col = st.columns([0.65, 1.35])
-    with image_col:
-        st.image(image, caption="Uploaded image", use_container_width=True)
-
-    with result_col:
         try:
             if use_api:
                 prediction = predict_with_api(image_bytes, uploaded_file.name, api_url, model_name=model_name)
             else:
                 prediction = predict_locally(image_bytes, model_name=model_name)
-            show_prediction(prediction)
         except Exception as exc:
             st.error(f"Prediction failed: {exc}")
             return
 
-    if enable_xai:
-        try:
-            show_xai(image, prediction, methods=methods, alpha=alpha, model_name=model_name)
-        except Exception as exc:
-            st.error(f"XAI visualization failed: {exc}")
+        image_col, result_col = st.columns([0.9, 1.1], gap="large")
+        with image_col:
+            with st.container(key="prediction-image", border=True):
+                st.caption("UPLOADED X-RAY")
+                st.image(image, use_container_width=True)
+                st.caption(uploaded_file.name)
+
+        with result_col:
+            with st.container(border=True):
+                show_prediction(prediction)
+
+        if enable_xai:
+            try:
+                show_xai(image, prediction, methods=methods, alpha=alpha, model_name=model_name)
+            except Exception as exc:
+                st.error(f"XAI visualization failed: {exc}")
 
 
 if __name__ == "__main__":
