@@ -36,9 +36,11 @@ from app.research.analysis import (
     merge_research_results,
     prediction_correctness_analysis,
     prediction_correctness_values,
+    prediction_records,
     wilcoxon_method_posthoc,
 )
 from app.research.results import ResearchResultsValidationError, load_research_results, validate_research_results
+from app.research.toolkit import build_research_toolkit_zip
 from app.xai import generate_xai_visualization, load_xai_model_by_name, predict_kl_with_xai_model, preprocess_pil_for_torch
 
 
@@ -338,16 +340,17 @@ def _summary_card_values(filtered: pd.DataFrame, definition) -> dict[str, object
     method = by_method.sort_values("Median", ascending=ascending).iloc[0]
     best_grade = by_grade.sort_values("Median", ascending=ascending).iloc[0]
     worst_grade = by_grade.sort_values("Median", ascending=not ascending).iloc[0]
-    concentration = definition.category == "complexity"
+    selected_label = "Lowest" if ascending else "Highest"
+    opposite_label = "Highest" if ascending else "Lowest"
 
     return {
         "samples": samples,
         "correct_rate": correct_rate,
-        "method_label": "Most concentrated method" if concentration else "Best method by median",
+        "method_label": f"{selected_label} median for selected metric",
         "method": str(method["xai_method"]),
-        "best_grade_label": "Most concentrated KL grade" if concentration else "Best KL grade",
+        "best_grade_label": f"{selected_label} median KL grade",
         "best_grade": int(best_grade["true_kl"]),
-        "worst_grade_label": "Least concentrated KL grade" if concentration else "Worst KL grade",
+        "worst_grade_label": f"{opposite_label} median KL grade",
         "worst_grade": int(worst_grade["true_kl"]),
     }
 
@@ -377,7 +380,12 @@ def _show_metric_dashboard(filtered: pd.DataFrame, selected_metric: str) -> None
 
     display_format = definition.display_format
     st.subheader(selected_metric)
-    st.caption(f"**{definition.score_direction.title()} is better.** {definition.description} {definition.interpretation}")
+    direction_text = (
+        "Higher means more concentrated, not necessarily better."
+        if definition.category == "complexity"
+        else f"{definition.score_direction.title()} is better for this metric."
+    )
+    st.caption(f"**{direction_text}** {definition.description} {definition.interpretation}")
     if not undefined_rows.empty:
         st.warning(
             f"{len(undefined_rows)} metric row(s) from {undefined_rows['sample_id'].nunique()} image(s) "
@@ -486,15 +494,16 @@ def _classifier_accuracy_chart_data(classifier_by_grade: pd.DataFrame) -> pd.Dat
 
 def _classifier_accuracy_chart(classifier_by_grade: pd.DataFrame):
     data = _classifier_accuracy_chart_data(classifier_by_grade)
-    model_order = sorted(data["Model"].unique())
+    data["Model display"] = data["Model"].map(_model_label)
+    model_order = [_model_label(name) for name in sorted(data["Model"].unique())]
     color_scale = alt.Scale(
         domain=model_order,
         range=["#2563eb", "#e76f51", "#7c3aed", "#0f766e"][: len(model_order)],
     )
     base = alt.Chart(data).encode(
         x=alt.X("True KL grade:N", title="True KL grade", sort=KL_GRADE_LABELS),
-        xOffset=alt.XOffset("Model:N", sort=model_order),
-        color=alt.Color("Model:N", title="Model", sort=model_order, scale=color_scale),
+        xOffset=alt.XOffset("Model display:N", sort=model_order),
+        color=alt.Color("Model display:N", title="Model", sort=model_order, scale=color_scale),
     )
     bars = base.mark_bar().encode(
         y=alt.Y(
@@ -504,7 +513,7 @@ def _classifier_accuracy_chart(classifier_by_grade: pd.DataFrame):
             axis=alt.Axis(format="%"),
         ),
         tooltip=[
-            alt.Tooltip("Model:N"),
+            alt.Tooltip("Model display:N", title="Model"),
             alt.Tooltip("True KL grade:N"),
             alt.Tooltip("Correct:Q"),
             alt.Tooltip("Images:Q", title="Images in XAI subset"),
@@ -516,6 +525,35 @@ def _classifier_accuracy_chart(classifier_by_grade: pd.DataFrame):
         text="Accuracy label:N",
     )
     return (bars + labels).properties(height=330)
+
+
+def _confusion_matrix_chart_data(matrix: pd.DataFrame) -> pd.DataFrame:
+    """Reshape existing classifier counts for display; do not recalculate predictions."""
+    counts = matrix.copy()
+    counts.index.name = "True KL"
+    counts.columns.name = "Predicted KL"
+    data = counts.stack().rename("Images").reset_index()
+    data["True KL"] = data["True KL"].str.replace("True ", "", regex=False)
+    data["Predicted KL"] = data["Predicted KL"].str.replace("Predicted ", "", regex=False)
+    return data
+
+
+def _confusion_matrix_chart(matrix: pd.DataFrame):
+    data = _confusion_matrix_chart_data(matrix)
+    max_count = max(int(data["Images"].max()), 1)
+    base = alt.Chart(data).encode(
+        x=alt.X("Predicted KL:N", sort=KL_GRADE_LABELS, title="Predicted KL grade"),
+        y=alt.Y("True KL:N", sort=KL_GRADE_LABELS, title="True KL grade"),
+    )
+    tiles = base.mark_rect(cornerRadius=3).encode(
+        color=alt.Color("Images:Q", title="Images", scale=alt.Scale(domain=[0, max_count], scheme="blues")),
+        tooltip=["True KL:N", "Predicted KL:N", alt.Tooltip("Images:Q", title="Images")],
+    )
+    labels = base.mark_text(fontSize=14, fontWeight="bold").encode(
+        text="Images:Q",
+        color=alt.condition(f"datum.Images > {max_count / 2}", alt.value("white"), alt.value("#17253E")),
+    )
+    return (tiles + labels).properties(height=330)
 
 
 def _effect_map_data(analysis: pd.DataFrame, model_name: str) -> pd.DataFrame:
@@ -676,7 +714,7 @@ def _method_comparison_chart(
         y=alt.Y("Median:Q", scale=y_scale),
         text="Median label:N",
     )
-    return (boxes + medians + labels).properties(title=model_name, height=330)
+    return (boxes + medians + labels).properties(title=_model_label(model_name), height=330)
 
 
 def _method_metric_caption(metric_name: str) -> str:
@@ -730,12 +768,14 @@ def _architecture_comparison_chart(values: pd.DataFrame, analysis: pd.DataFrame,
     data = _architecture_comparison_plot_data(values, metric_name)
     summary = _architecture_median_summary(analysis, metric_name)
     y_scale = _method_comparison_y_scale(values, metric_name)
-    model_pair = list(data["Model"].cat.categories)
+    data["Model display"] = data["Model"].map(_model_label)
+    summary["Model display"] = summary["Model"].map(_model_label)
+    model_pair = [_model_label(name) for name in data["Model"].cat.categories]
     color_scale = alt.Scale(domain=model_pair, range=["#e76f51", "#2563eb"])
     base = alt.Chart(data).encode(
         x=alt.X("XAI method:N", title="XAI method", sort=XAI_METHODS, axis=alt.Axis(labelAngle=-30)),
-        xOffset=alt.XOffset("Model:N", sort=model_pair),
-        color=alt.Color("Model:N", title="Model", sort=model_pair, scale=color_scale),
+        xOffset=alt.XOffset("Model display:N", sort=model_pair),
+        color=alt.Color("Model display:N", title="Model", sort=model_pair, scale=color_scale),
     )
     boxes = base.mark_boxplot(size=30).encode(
         y=alt.Y(
@@ -746,7 +786,7 @@ def _architecture_comparison_chart(values: pd.DataFrame, analysis: pd.DataFrame,
     )
     medians = alt.Chart(summary).mark_point(shape="diamond", filled=True, color="#111827", size=48).encode(
         x=alt.X("XAI method:N", sort=XAI_METHODS),
-        xOffset=alt.XOffset("Model:N", sort=model_pair),
+        xOffset=alt.XOffset("Model display:N", sort=model_pair),
         y=alt.Y("Median:Q", scale=y_scale),
         tooltip=[
             alt.Tooltip("Model label:N", title="Model"),
@@ -758,7 +798,7 @@ def _architecture_comparison_chart(values: pd.DataFrame, analysis: pd.DataFrame,
     )
     labels = alt.Chart(summary).mark_text(dy=-11, color="#111827", fontSize=9).encode(
         x=alt.X("XAI method:N", sort=XAI_METHODS),
-        xOffset=alt.XOffset("Model:N", sort=model_pair),
+        xOffset=alt.XOffset("Model display:N", sort=model_pair),
         y=alt.Y("Median:Q", scale=y_scale),
         text="Median label:N",
     )
@@ -868,483 +908,664 @@ def _cached_prediction_correctness_analysis(results: pd.DataFrame) -> pd.DataFra
     return prediction_correctness_analysis(results)
 
 
-def _show_results_analysis(results: pd.DataFrame) -> None:
-    st.subheader("Research overview")
-    st.caption(
-        "This overview uses the selected image cohort from the loaded XAI result files. Top filters apply only to "
-        "Explore metrics, so they cannot distort classifier-subset accuracy or primary KL-stage analysis."
+@st.cache_data(show_spinner=False)
+def _cached_classifier_summary(results: pd.DataFrame):
+    return classifier_subset_summary(results)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_kl_analysis(results: pd.DataFrame):
+    return kl_stage_analysis(results)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_method_analysis(results: pd.DataFrame):
+    matrices = method_complete_case_matrices(results)
+    return (
+        matrices,
+        method_comparison_values(matrices),
+        method_comparison_descriptives(matrices),
+        friedman_method_analysis(matrices),
     )
 
-    model_sets = {model_id: set(group["sample_id"]) for model_id, group in results.groupby("model_name")}
-    different_cohorts = len({frozenset(ids) for ids in model_sets.values()}) > 1
-    cohort_options = ["All loaded images"]
+
+@st.cache_data(show_spinner=False)
+def _cached_architecture_analysis(results: pd.DataFrame, models: tuple[str, str], same_target: bool):
+    pairs = architecture_complete_case_pairs(results, models=models, same_target_only=same_target)
+    return architecture_comparison_values(pairs), architecture_comparison_analysis(pairs)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_dunn_analysis(results: pd.DataFrame, analysis: pd.DataFrame):
+    return dunn_posthoc(results, analysis)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_method_posthoc(matrices, summary):
+    return wilcoxon_method_posthoc(matrices, summary)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_toolkit() -> bytes:
+    return build_research_toolkit_zip(Path(__file__).resolve().parent)
+
+
+def _model_label(model_id: str) -> str:
+    return MODEL_CONFIGS.get(model_id, {}).get("display_name", model_id)
+
+
+def _validate_shared_cohort(results: pd.DataFrame) -> None:
+    """Do not interpret colliding sample IDs as paired images when metadata differ."""
+    records = prediction_records(results)
+    shared = records[records.duplicated("sample_id", keep=False)]
+    for field in ("image_path", "true_kl", "split"):
+        field_rows = (
+            shared if field in shared.columns
+            else results.drop_duplicates(["model_name", "sample_id"])
+        )
+        conflicts = field_rows[field_rows.duplicated("sample_id", keep=False)].groupby("sample_id")[field].nunique(dropna=False)
+        if (conflicts > 1).any():
+            sample_id = str(conflicts[conflicts > 1].index[0])
+            raise ResearchAnalysisError(
+                f"Shared sample ID {sample_id} has conflicting {field} across models. "
+                "Load CSVs from compatible image cohorts before comparing them."
+            )
+    if "selected_sample_content_sha256" in results.columns:
+        hashes = results.groupby("model_name")["selected_sample_content_sha256"].first().dropna()
+        model_sets = [frozenset(group["sample_id"]) for _, group in results.groupby("model_name")]
+        if len(hashes) > 1 and hashes.nunique() > 1 and len(set(model_sets)) == 1:
+            raise ResearchAnalysisError(
+                "Loaded models record different selected-image content hashes. "
+                "Do not combine these experiment cohorts."
+            )
+
+
+def _download_csv(label: str, frame: pd.DataFrame, filename: str, key: str) -> None:
+    st.download_button(
+        label, frame.to_csv(index=False).encode("utf-8-sig"),
+        file_name=filename, mime="text/csv", key=key,
+    )
+
+
+def _research_cohort(results: pd.DataFrame) -> pd.DataFrame:
+    model_sets = {name: set(group["sample_id"]) for name, group in results.groupby("model_name")}
+    options = ["All loaded images"]
     if len(model_sets) > 1:
-        cohort_options.append("Images shared by all loaded models")
-    original_ids = set()
+        options.append("Images shared by all loaded models")
     base_manifest = Path(__file__).resolve().parent / "inputs/test/test_manifest.json"
+    original_ids = set()
     if base_manifest.is_file():
         try:
             original_ids = {
-                str(sample["sample_id"])
-                for sample in json.loads(base_manifest.read_text(encoding="utf-8"))["samples"]
+                str(item["sample_id"])
+                for item in json.loads(base_manifest.read_text(encoding="utf-8"))["samples"]
             }
         except (OSError, ValueError, KeyError, TypeError):
             pass
     if original_ids:
-        cohort_options.append("Original 150-image subset")
-    if different_cohorts:
+        options.append(f"Images in repository test manifest ({len(original_ids)})")
+    different = len({frozenset(ids) for ids in model_sets.values()}) > 1
+    if different:
         st.warning(
-            "Loaded models do not have identical image sets. Per-model summaries use their own available images; "
-            "paired tests use only shared sample IDs. Select a common cohort for direct comparisons."
+            "The loaded models use different image sets. Per-model summaries use available images; "
+            "paired tests retain shared sample IDs only."
         )
+        if "selected_sample_content_sha256" in results.columns:
+            st.caption("Dataset content hashes differ across runs because their selected image cohorts differ; verify provenance before interpreting paired tests.")
+    if len(model_sets) > 1 and not set.intersection(*model_sets.values()):
+        st.warning("No sample IDs are shared by all loaded models; paired comparison is unavailable.")
     cohort = st.selectbox(
-        "Results-analysis cohort", cohort_options,
-        index=1 if different_cohorts and len(model_sets) > 1 else 0,
+        "Analysis cohort", options, index=0,
+        help="Applies to analysis sections. Explore & Export has additional local filters.",
+        key="research-cohort",
     )
     if cohort == "Images shared by all loaded models":
-        results = results[results["sample_id"].isin(set.intersection(*model_sets.values()))].copy()
-    elif cohort == "Original 150-image subset":
-        results = results[results["sample_id"].isin(original_ids)].copy()
-    if results.empty:
-        st.info("No images are available in the selected cohort.")
-        return
+        results = results[results["sample_id"].isin(set.intersection(*model_sets.values()))]
+    elif cohort.startswith("Images in repository"):
+        results = results[results["sample_id"].isin(original_ids)]
+    return results.copy()
 
-    try:
-        classifier_summary, classifier_by_grade, confusion_matrices = classifier_subset_summary(results)
-        analysis = kl_stage_analysis(results)
-        method_matrices = method_complete_case_matrices(results)
-        method_values = method_comparison_values(method_matrices)
-        method_descriptives = method_comparison_descriptives(method_matrices)
-        friedman_summary = friedman_method_analysis(method_matrices)
-    except ResearchAnalysisError as exc:
-        st.error(f"Results analysis cannot be calculated: {exc}")
-        return
 
-    st.markdown("#### Classification accuracy by true KL grade")
-    st.caption(
-        "Each bar shows correct predictions divided by all images of that true KL grade. "
-        "These are results for the loaded XAI subset, not the full held-out classifier test set."
-    )
-    st.altair_chart(_classifier_accuracy_chart(classifier_by_grade), use_container_width=True)
-
-    st.markdown("#### KL-stage effect map")
-    st.caption(
-        "Each cell is the Kruskal–Wallis epsilon-squared effect size (ε²) for one XAI method and metric. "
-        "A * marks a Holm-significant global KL-stage test. Both models use the same colour scale."
-    )
-    model_names = sorted(analysis["Model"].unique())
-    effect_scale_max = _effect_map_scale_max(analysis)
-    map_columns = st.columns(min(len(model_names), 2)) if model_names else []
-    for index, model_name in enumerate(model_names):
-        # Streamlit columns are reused gracefully if an uploaded set has more than two models.
-        with map_columns[index % len(map_columns)]:
-            st.altair_chart(
-                _effect_map_chart(_effect_map_data(analysis, model_name), model_name, effect_scale_max),
-                use_container_width=True,
-            )
-    st.caption(
-        "ε² describes the strength of association between true KL stage and this specific metric; it is not an "
-        "XAI-method quality score or leaderboard. A result that is significant for one architecture and not the other "
-        "does not by itself establish an architecture difference. Sparseness describes concentration, while region "
-        "perturbation is a configuration-dependent supporting faithfulness check."
-    )
-
-    st.markdown("#### XAI-method comparison")
-    st.caption(
-        "Each metric is analysed separately with paired complete-case samples. The five methods are evaluated on the "
-        "same images; no overall XAI score, method leaderboard, or KL-stratified method test is created here."
-    )
-    metric_tabs = st.tabs(list(METHOD_COMPARISON_METRICS))
-    for tab, metric_name in zip(metric_tabs, METHOD_COMPARISON_METRICS):
-        with tab:
-            st.caption(_method_metric_caption(metric_name))
-            metric_tests = friedman_summary[friedman_summary["Metric"].eq(metric_name)]
-            if metric_tests.empty or method_values[method_values["Metric"].eq(metric_name)].empty:
-                st.info("No complete paired values are available for this metric in the loaded files.")
-                continue
-            model_columns = st.columns(min(len(metric_tests), 2))
-            y_scale = _method_comparison_y_scale(method_values, metric_name)
-            for index, (_, test_row) in enumerate(metric_tests.iterrows()):
-                with model_columns[index % len(model_columns)]:
-                    st.caption(
-                        f"Complete paired samples: {int(test_row['Valid N'])}; "
-                        f"excluded: {int(test_row['Excluded N'])}."
-                    )
-                    st.altair_chart(
-                        _method_comparison_chart(
-                            method_values,
-                            method_descriptives,
-                            test_row,
-                            metric_name,
-                            str(test_row["Model"]),
-                            y_scale,
-                        ),
-                        use_container_width=True,
-                    )
-            st.markdown("**Complete-case descriptive summary**")
-            metric_descriptives = method_descriptives[method_descriptives["Metric"].eq(metric_name)]
-            st.dataframe(_format_results_analysis_table(metric_descriptives), use_container_width=True, hide_index=True)
-
-    with st.expander("Friedman XAI-method statistics"):
-        st.caption(
-            "Each test compares the five paired XAI methods within one model and metric. "
-            "Holm correction is applied across the five metric-level Friedman tests separately for each model. "
-            "Kendall's W = χ² / (N × 4)."
+def _research_data_summary(results: pd.DataFrame) -> None:
+    records = prediction_records(results)
+    status = results.get("metric_status", pd.Series("ok", index=results.index))
+    values = pd.to_numeric(results["metric_value"], errors="coerce")
+    undefined = int((status.ne("ok") | ~np.isfinite(values)).sum())
+    cards = st.columns(5)
+    for card, label, value in zip(
+        cards,
+        ("Models", "Unique images", "XAI methods", "Metrics", "Undefined values"),
+        (results["model_name"].nunique(), records["sample_id"].nunique(),
+         results["xai_method"].nunique(), results["metric_name"].nunique(), undefined),
+    ):
+        card.metric(label, str(value))
+    if undefined:
+        st.warning(f"{undefined} metric result(s) are undefined and are excluded from tests without imputation.")
+    absent_methods = [name for name in XAI_METHODS if name not in set(results["xai_method"])]
+    absent_metrics = [name for name in METHOD_COMPARISON_METRICS if name not in set(results["metric_name"])]
+    if absent_methods or absent_metrics:
+        st.warning(
+            "Incomplete XAI result set. Missing methods: "
+            + (", ".join(absent_methods) or "none")
+            + ". Missing metrics: " + (", ".join(absent_metrics) or "none") + "."
         )
-        st.dataframe(_format_results_analysis_table(friedman_summary), use_container_width=True, hide_index=True)
-        st.download_button(
-            "Download Friedman XAI-method summary CSV",
-            data=friedman_summary.to_csv(index=False).encode("utf-8"),
-            file_name="friedman_xai_method_analysis.csv",
-            mime="text/csv",
-        )
-
-    with st.expander("Wilcoxon post-hoc method pairs"):
-        posthoc_methods = wilcoxon_method_posthoc(method_matrices, friedman_summary)
-        if posthoc_methods.empty:
-            st.info("No Holm-significant Friedman result is available for pairwise XAI-method comparison.")
-        else:
-            st.caption(
-                "Two-sided paired Wilcoxon signed-rank tests are shown only after a Holm-significant Friedman test. "
-                "Holm correction is applied across the ten method pairs within that metric."
-            )
-            st.dataframe(_format_results_analysis_table(posthoc_methods), use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download Wilcoxon XAI-method pairs CSV",
-                data=posthoc_methods.to_csv(index=False).encode("utf-8"),
-                file_name="wilcoxon_xai_method_pairs.csv",
-                mime="text/csv",
-            )
-
-    st.markdown("#### Paired model comparison")
-    st.caption(
-        "Compare architectures within one training variant, or training variants within one architecture. "
-        "Only the same image, XAI method and metric are paired; no overall model winner is inferred."
-    )
-    possible_pairs = [
-        ("Architecture: ordinal BCE", ("densenet121", "resnet50")),
-        ("Architecture: class-aware ordinal BCE", ("densenet121_class_aware", "resnet50_class_aware")),
-        ("Training variant: DenseNet121", ("densenet121_class_aware", "densenet121")),
-        ("Training variant: ResNet50", ("resnet50_class_aware", "resnet50")),
-    ]
-    available_pairs = [(label, models) for label, models in possible_pairs if set(models).issubset(model_sets)]
-    if not available_pairs:
-        st.info("Load a compatible pair of model CSV files to enable paired model comparisons.")
-    else:
-        comparison_name = st.selectbox("Model comparison", [label for label, _ in available_pairs])
-        selected_pair = next(models for label, models in available_pairs if label == comparison_name)
-        try:
-            architecture_primary_pairs = architecture_complete_case_pairs(results, models=selected_pair)
-            architecture_same_target_pairs = architecture_complete_case_pairs(
-                results, same_target_only=True, models=selected_pair
-            )
-        except ResearchAnalysisError as exc:
-            st.info(f"Paired model comparison is unavailable: {exc}")
-            architecture_primary_pairs = None
-        if architecture_primary_pairs is not None:
-            architecture_mode = st.radio(
-                "Paired model comparison mode",
-                ["Primary: all paired samples", "Sensitivity: same predicted KL target"],
-                horizontal=True,
-            )
-            sensitivity_mode = architecture_mode.startswith("Sensitivity")
-            architecture_pairs = (
-                architecture_same_target_pairs if sensitivity_mode else architecture_primary_pairs
-            )
-            architecture_values = architecture_comparison_values(architecture_pairs)
-            architecture_summary = architecture_comparison_analysis(architecture_pairs)
-            if sensitivity_mode:
-                st.warning(
-                    "Sensitivity analysis: only images for which both models predicted the same KL class are retained. "
-                    "This reduces confounding from different XAI target classes, but analyses a smaller selected cohort."
-                )
-            else:
-                st.caption(
-                    "Primary analysis includes every complete finite pair, even when the two models predicted different KL classes."
-                )
-
-            architecture_tabs = st.tabs(list(METHOD_COMPARISON_METRICS))
-            for tab, metric_name in zip(architecture_tabs, METHOD_COMPARISON_METRICS):
-                with tab:
-                    st.caption(_method_metric_caption(metric_name))
-                    metric_values = architecture_values[architecture_values["Metric"].eq(metric_name)]
-                    if metric_values.empty:
-                        st.info("No complete paired values are available for this metric.")
-                        continue
-                    st.altair_chart(
-                        _architecture_comparison_chart(architecture_values, architecture_summary, metric_name),
-                        use_container_width=True,
-                    )
-                    metric_summary = architecture_summary[architecture_summary["Metric"].eq(metric_name)]
-                    st.dataframe(_format_results_analysis_table(metric_summary), use_container_width=True, hide_index=True)
-
-            with st.expander("Paired-model Wilcoxon statistics"):
-                st.caption(
-                    "One two-sided paired Wilcoxon signed-rank test is calculated per XAI method × metric. "
-                    "Holm correction is applied across 25 tests for the selected model pair. "
-                    f"Positive paired effects mean higher values for {selected_pair[0]} than {selected_pair[1]}."
-                )
-                st.dataframe(_format_results_analysis_table(architecture_summary), use_container_width=True, hide_index=True)
-                suffix = "same_target" if sensitivity_mode else "all_pairs"
-                st.download_button(
-                    "Download paired-model comparison CSV",
-                    data=architecture_summary.to_csv(index=False).encode("utf-8"),
-                    file_name=f"model_comparison_{selected_pair[0]}_vs_{selected_pair[1]}_{suffix}.csv",
-                    mime="text/csv",
-                )
-
-    st.markdown("#### Prediction correctness analysis")
-    st.caption(
-        "Correctness is derived as predicted KL = true KL. Each comparison remains within one model, XAI method, "
-        "and metric; a significant result is not evidence that an explanation is faithful or clinically valid."
-    )
-    try:
-        correctness_values = prediction_correctness_values(results)
-        correctness_summary = _cached_prediction_correctness_analysis(results)
-    except ResearchAnalysisError as exc:
-        st.info(f"Prediction correctness analysis is unavailable: {exc}")
-    else:
-        correctness_mode = st.radio(
-            "Prediction correctness analysis mode",
-            ["Primary: pooled correct vs incorrect", "KL-adjusted sensitivity: stratified permutation"],
-            horizontal=True,
-        )
-        kl_adjusted_mode = correctness_mode.startswith("KL-adjusted")
-        if kl_adjusted_mode:
+    for model_name, model_rows in results.groupby("model_name", sort=True):
+        missing_methods = set(XAI_METHODS) - set(model_rows["xai_method"])
+        missing_metrics = set(METHOD_COMPARISON_METRICS) - set(model_rows["metric_name"])
+        if missing_methods or missing_metrics:
             st.warning(
-                "KL-adjusted sensitivity analysis shuffles correctness labels only within each true-KL stratum, preserving "
-                "stratum-specific group sizes. It tests whether the pooled effect remains after accounting for KL composition."
+                f"{_model_label(model_name)} has incomplete results: "
+                f"missing methods {', '.join(sorted(missing_methods)) or 'none'}; "
+                f"missing metrics {', '.join(sorted(missing_metrics)) or 'none'}."
             )
+
+
+def _show_research_overview(results: pd.DataFrame) -> None:
+    st.subheader("Overview")
+    st.caption("Classifier statistics describe the loaded XAI image subset, not automatically the full held-out test set.")
+    try:
+        summary, grades, matrices = _cached_classifier_summary(results)
+    except ResearchAnalysisError as exc:
+        st.error(f"Classifier-subset analysis unavailable: {exc}")
+        return
+    records = prediction_records(results)
+    counts = records.groupby("true_kl")["sample_id"].nunique().reindex(range(5), fill_value=0)
+    st.caption("Image distribution by true KL grade: " + " · ".join(f"KL{k}: {int(n)}" for k, n in counts.items()))
+    with st.container(border=True):
+        st.markdown("#### Classification accuracy by true KL grade")
+        st.altair_chart(_classifier_accuracy_chart(grades), use_container_width=True)
+    with st.container(border=True):
+        st.markdown("#### Classification performance · loaded XAI subset")
+        compact = summary.copy()
+        compact["Model"] = compact["Model"].map(_model_label)
+        st.dataframe(_format_results_analysis_table(compact), use_container_width=True, hide_index=True)
+    selected = st.selectbox(
+        "Confusion matrix model", list(matrices),
+        format_func=_model_label, key="overview-confusion-model",
+    )
+    with st.container(border=True):
+        st.caption(f"Confusion matrix · {_model_label(selected)}")
+        st.altair_chart(_confusion_matrix_chart(matrices[selected]), use_container_width=True)
+        with st.expander("View confusion matrix counts as a table"):
+            st.dataframe(matrices[selected], use_container_width=True)
+    outcomes = records.groupby("model_name")["is_correct"].agg(["sum", "count"]).reset_index()
+    outcomes["Incorrect"] = outcomes["count"] - outcomes["sum"]
+    outcomes["Model"] = outcomes["model_name"].map(_model_label)
+    st.caption("Correct and incorrect predictions in the loaded XAI subset")
+    st.dataframe(
+        outcomes[["Model", "sum", "Incorrect"]].rename(columns={"sum": "Correct"}),
+        use_container_width=True, hide_index=True,
+    )
+    with st.expander("Per-KL classifier details"):
+        st.dataframe(_format_results_analysis_table(grades), use_container_width=True, hide_index=True)
+        _download_csv("Download classifier subset summary", summary, "classifier_subset_summary.csv", "download-classifier-summary")
+        _download_csv("Download per-KL classifier details", grades, "classifier_by_kl_grade.csv", "download-classifier-kl")
+
+
+def _kl_distribution_chart(results: pd.DataFrame, model: str, metric: str):
+    status = results.get("metric_status", pd.Series("ok", index=results.index))
+    data = results[
+        results["model_name"].eq(model) & results["metric_name"].eq(metric) & status.eq("ok")
+    ].copy()
+    data["metric_value"] = pd.to_numeric(data["metric_value"], errors="coerce")
+    data = data[np.isfinite(data["metric_value"])]
+    data["KL grade"] = data["true_kl"].map(lambda value: f"KL{value}")
+    if data.empty:
+        return None
+    scale = _method_comparison_y_scale(
+        data.rename(columns={"metric_name": "Metric"}), metric
+    )
+    return alt.Chart(data).mark_boxplot(size=24).encode(
+        x=alt.X("KL grade:N", sort=KL_GRADE_LABELS, title="True KL grade"),
+        xOffset=alt.XOffset("xai_method:N", sort=XAI_METHODS),
+        y=alt.Y("metric_value:Q", title=metric, scale=scale),
+        color=alt.Color("xai_method:N", title="XAI method", sort=XAI_METHODS),
+        tooltip=[
+            alt.Tooltip("KL grade:N"),
+            alt.Tooltip("xai_method:N", title="XAI method"),
+            alt.Tooltip("metric_value:Q", format=".4g"),
+        ],
+    ).properties(height=340)
+
+
+def _show_kl_stage(results: pd.DataFrame) -> None:
+    st.subheader("KL-stage Analysis")
+    st.caption("Associations with true KL grade are metric-specific; they do not establish a causal KL effect or an overall XAI ranking.")
+    try:
+        analysis = _cached_kl_analysis(results)
+    except ResearchAnalysisError as exc:
+        st.error(f"KL-stage analysis unavailable: {exc}")
+        return
+    models = sorted(results["model_name"].unique())
+    selectors = st.columns(2)
+    model = selectors[0].selectbox("Model", models, format_func=_model_label, key="kl-model")
+    metric = selectors[1].selectbox("XAI metric", list(METHOD_COMPARISON_METRICS), key="kl-metric")
+    st.caption(_method_metric_caption(metric))
+    with st.container(border=True):
+        st.markdown("#### Distribution across KL0–KL4")
+        chart = _kl_distribution_chart(results, model, metric)
+        if chart is None:
+            st.info("No finite values are available for this model and metric.")
         else:
-            st.caption(
-                "Primary analysis compares all valid correct and incorrect predictions for the selected model × method × metric."
-            )
-
-        st.caption(
-            "Heatmap values are pooled rank-biserial effects (correct − incorrect): positive means correct predictions have "
-            "higher metric values. A * marks Holm significance in the selected mode; whether higher is preferable depends on the metric."
-        )
-        correctness_models = sorted(correctness_summary["Model"].unique())
-        heatmap_columns = st.columns(min(len(correctness_models), 2))
-        for index, model_name in enumerate(correctness_models):
-            with heatmap_columns[index % len(heatmap_columns)]:
-                heatmap_data = _correctness_effect_heatmap_data(
-                    correctness_summary, model_name, kl_adjusted=kl_adjusted_mode
-                )
-                st.altair_chart(_correctness_effect_heatmap(heatmap_data, model_name), use_container_width=True)
-
-        st.markdown("**Individual distribution**")
-        selectors = st.columns(3)
-        selected_model = selectors[0].selectbox(
-            "Model", correctness_models, key="correctness-distribution-model"
-        )
-        selected_metric = selectors[1].selectbox(
-            "Metric", list(METHOD_COMPARISON_METRICS), key="correctness-distribution-metric"
-        )
-        selected_method = selectors[2].selectbox(
-            "XAI method", XAI_METHODS, key="correctness-distribution-method"
-        )
-        selected_test = correctness_summary[
-            correctness_summary["Model"].eq(selected_model)
-            & correctness_summary["Metric"].eq(selected_metric)
-            & correctness_summary["XAI method"].eq(selected_method)
-        ].iloc[0]
-        st.altair_chart(
-            _correctness_distribution_chart(correctness_values, selected_test, selected_metric),
-            use_container_width=True,
-        )
-        selected_p = (
-            selected_test["KL-adjusted permutation p Holm"]
-            if kl_adjusted_mode else selected_test["p Holm"]
-        )
-        st.caption(
-            f"Correct N: {int(selected_test['Correct N'])}; incorrect N: {int(selected_test['Incorrect N'])}; "
-            f"excluded: {int(selected_test['Excluded N'])}; Holm-adjusted p: {selected_p:.3g}."
-        )
-
-        with st.expander("Prediction-correctness statistics"):
-            st.caption(
-                "The table includes primary Mann–Whitney and KL-adjusted permutation results. "
-                "Holm correction is applied separately across 25 tests for each model in each analysis mode."
-            )
-            st.dataframe(_format_results_analysis_table(correctness_summary), use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download prediction-correctness analysis CSV",
-                data=correctness_summary.to_csv(index=False).encode("utf-8"),
-                file_name="prediction_correctness_analysis.csv",
-                mime="text/csv",
-            )
-
-    grade_n_columns = [f"KL{grade} n" for grade in range(5)]
-    tests_per_model = analysis.groupby("Model").size()
-    complete_primary_family = tests_per_model.eq(25).all() and analysis["KL groups"].eq(5).all()
-    if not complete_primary_family:
-        st.warning(
-            "Incomplete primary test family: thesis-level inference expects five metrics, five XAI methods, "
-            "and all five KL groups for each selected model. Displayed statistics are exploratory."
-        )
-    if (analysis[grade_n_columns] < 10).any().any():
-        st.warning("Small-sample warning: at least one KL group has fewer than 10 valid values.")
-    excluded = int(analysis["Excluded undefined"].sum())
-    if excluded:
-        st.warning(
-            f"{excluded} undefined metric row(s) were excluded without imputation; their valid companion metrics remain included."
-        )
-
-    with st.expander("Classifier subset details"):
-        st.caption("These metrics describe only images included in the loaded XAI CSV files, not the full held-out classifier test set.")
-        st.dataframe(_format_results_analysis_table(classifier_summary), use_container_width=True, hide_index=True)
-        st.dataframe(_format_results_analysis_table(classifier_by_grade), use_container_width=True, hide_index=True)
-        for model_name, matrix in confusion_matrices.items():
-            st.markdown(f"**{model_name}: confusion matrix**")
-            st.dataframe(matrix, use_container_width=True)
-
-    with st.expander("KL-stage statistical table"):
-        st.caption(
-            "Kruskal–Wallis tests compare true KL groups within one model × XAI method × metric. "
-            "Holm correction is applied separately within each model. "
-            "ε² = max(0, (H − k + 1) / (N − k))."
-        )
+            st.altair_chart(chart, use_container_width=True)
+    st.markdown("#### KL-stage effect map")
+    st.caption("Cells show ε² for one metric × method. * denotes a Holm-significant Kruskal–Wallis test. A common colour scale is used across models.")
+    scale = _effect_map_scale_max(analysis)
+    for offset in range(0, len(models), 2):
+        columns = st.columns(min(2, len(models) - offset))
+        for column, model_name in zip(columns, models[offset:offset + 2]):
+            with column:
+                with st.container(border=True):
+                    st.altair_chart(
+                        _effect_map_chart(_effect_map_data(analysis, model_name), _model_label(model_name), scale),
+                        use_container_width=True,
+                    )
+    selected = analysis[analysis["Model"].eq(model) & analysis["Metric"].eq(metric)]
+    st.markdown("#### Kruskal–Wallis results")
+    st.caption(
+        "Null hypothesis: this metric has the same distribution across true KL groups for a given model and XAI method. "
+        "Holm correction is applied within each model; ε² = max(0, (H − k + 1) / (N − k)). "
+        "The effect is not a measure of clinical explanation quality."
+    )
+    st.dataframe(_format_results_analysis_table(selected), use_container_width=True, hide_index=True)
+    if not selected.empty:
+        n_columns = [f"KL{k} n" for k in range(5)]
+        if (selected[n_columns] < 10).any().any():
+            st.warning("At least one selected KL group has fewer than ten valid images.")
+        excluded = int(selected["Excluded undefined"].sum())
+        if excluded:
+            st.warning(f"{excluded} undefined observation(s) were excluded without imputation.")
+    family_complete = (
+        analysis.groupby("Model").size().eq(25).all()
+        and analysis["KL groups"].eq(5).all()
+    )
+    if not family_complete:
+        st.warning("The primary 25-test family or five KL groups are incomplete; interpret results as exploratory.")
+    with st.expander("Complete KL-stage statistical table and CSV"):
         st.dataframe(_format_results_analysis_table(analysis), use_container_width=True, hide_index=True)
-        st.download_button(
-            "Download KL-stage summary CSV",
-            data=analysis.to_csv(index=False).encode("utf-8"),
-            file_name="kl_stage_analysis.csv",
-            mime="text/csv",
+        _download_csv("Download KL-stage summary", analysis, "kl_stage_analysis.csv", "download-kl")
+    with st.expander("Dunn post-hoc KL comparisons"):
+        if not family_complete:
+            st.info("Dunn results require the complete primary KL analysis for every selected model.")
+        else:
+            try:
+                posthoc = _cached_dunn_analysis(results, analysis)
+            except ResearchAnalysisError as exc:
+                st.error(f"Dunn post-hoc unavailable: {exc}")
+            else:
+                if posthoc.empty:
+                    st.info("No Holm-significant global KL test is available for Dunn pairwise comparisons.")
+                else:
+                    st.caption("Pairs are tested only after a Holm-significant global result; the ten pairwise p-values are Holm-adjusted within that test.")
+                    st.dataframe(_format_results_analysis_table(posthoc), use_container_width=True, hide_index=True)
+                    _download_csv("Download Dunn comparisons", posthoc, "dunn_posthoc_kl_pairs.csv", "download-dunn")
+
+
+def _show_xai_methods(results: pd.DataFrame) -> None:
+    st.subheader("XAI Methods")
+    st.caption("Five methods are compared on paired complete-case images within each model and metric. There is no cross-metric score or universal winner.")
+    metric = st.selectbox("XAI metric", list(METHOD_COMPARISON_METRICS), key="methods-metric")
+    st.caption(_method_metric_caption(metric))
+    try:
+        matrices, values, descriptives, summary = _cached_method_analysis(results)
+    except ResearchAnalysisError as exc:
+        st.error(f"XAI-method analysis unavailable: {exc}")
+        return
+    selected = summary[summary["Metric"].eq(metric)]
+    if selected.empty or values[values["Metric"].eq(metric)].empty:
+        st.info("No complete paired samples are available for this metric.")
+        return
+    scale = _method_comparison_y_scale(values, metric)
+    rows = list(selected.iterrows())
+    for offset in range(0, len(rows), 2):
+        columns = st.columns(min(2, len(rows) - offset))
+        for column, (_, row) in zip(columns, rows[offset:offset + 2]):
+            with column:
+                with st.container(border=True):
+                    st.caption(f"{_model_label(str(row['Model']))}: valid N {int(row['Valid N'])}; excluded N {int(row['Excluded N'])}")
+                    st.altair_chart(
+                        _method_comparison_chart(values, descriptives, row, metric, str(row["Model"]), scale),
+                        use_container_width=True,
+                    )
+    st.markdown("#### Median and IQR · complete-case images")
+    st.dataframe(
+        _format_results_analysis_table(descriptives[descriptives["Metric"].eq(metric)]),
+        use_container_width=True, hide_index=True,
+    )
+    st.markdown("#### Friedman paired test")
+    st.caption(
+        "Null hypothesis: the five XAI methods have equal rank distributions on the same images. "
+        "Holm corrects five metric tests per model; Kendall's W is the effect size."
+    )
+    st.dataframe(_format_results_analysis_table(selected), use_container_width=True, hide_index=True)
+    with st.expander("Wilcoxon post-hoc method pairs"):
+        try:
+            posthoc = _cached_method_posthoc(matrices, summary)
+        except ResearchAnalysisError as exc:
+            st.error(f"Wilcoxon post-hoc unavailable: {exc}")
+        else:
+            posthoc = posthoc[posthoc["Metric"].eq(metric)] if not posthoc.empty else posthoc
+            if posthoc.empty:
+                st.info("No Holm-significant Friedman result for this metric; no pairwise test is shown.")
+            else:
+                st.caption("Two-sided paired tests; Holm correction over ten method pairs within each significant model–metric test.")
+                st.dataframe(_format_results_analysis_table(posthoc), use_container_width=True, hide_index=True)
+                _download_csv("Download Wilcoxon pairs", posthoc, f"wilcoxon_{metric}.csv", "download-method-posthoc")
+    with st.expander("Full XAI-method tables and CSV"):
+        st.dataframe(_format_results_analysis_table(summary), use_container_width=True, hide_index=True)
+        _download_csv("Download Friedman summary", summary, "friedman_xai_method_analysis.csv", "download-friedman")
+        _download_csv("Download method descriptives", descriptives, "xai_method_descriptives.csv", "download-method-descriptive")
+
+
+MODEL_COMPARISON_OPTIONS = (
+    ("Architecture · ordinal BCE", ("densenet121", "resnet50")),
+    ("Architecture · class-aware ordinal BCE", ("densenet121_class_aware", "resnet50_class_aware")),
+    ("Training variant · DenseNet121", ("densenet121_class_aware", "densenet121")),
+    ("Training variant · ResNet50", ("resnet50_class_aware", "resnet50")),
+)
+
+
+def _show_paired_models(results: pd.DataFrame) -> None:
+    available = set(results["model_name"])
+    choices = [(label, pair) for label, pair in MODEL_COMPARISON_OPTIONS if set(pair).issubset(available)]
+    if not choices:
+        st.info("Load a compatible model pair to enable paired model analysis.")
+        return
+    choice = st.selectbox("Comparison", [label for label, _ in choices], key="paired-model-choice")
+    pair = next(models for label, models in choices if label == choice)
+    if not set(results.loc[results["model_name"].eq(pair[0]), "sample_id"]) & set(
+        results.loc[results["model_name"].eq(pair[1]), "sample_id"]
+    ):
+        st.warning("These models have no shared sample IDs, so a paired comparison is unavailable.")
+        return
+    mode = st.radio(
+        "Analysis population",
+        ["Primary · all paired images", "Sensitivity · same predicted KL target"],
+        horizontal=True, key="paired-model-mode",
+    )
+    same_target = mode.startswith("Sensitivity")
+    if same_target:
+        st.warning("Sensitivity analysis retains only images with the same predicted KL target in both models.")
+    else:
+        st.caption("Different predicted KL targets are retained and are not hidden in this primary analysis.")
+    try:
+        values, summary = _cached_architecture_analysis(results, pair, same_target)
+    except ResearchAnalysisError as exc:
+        st.info(f"Paired model comparison unavailable: {exc}")
+        return
+    metric = st.selectbox("XAI metric", list(METHOD_COMPARISON_METRICS), key="paired-model-metric")
+    st.caption(_method_metric_caption(metric))
+    if values[values["Metric"].eq(metric)].empty:
+        st.info("No finite paired values are available for this metric.")
+    else:
+        st.altair_chart(_architecture_comparison_chart(values, summary, metric), use_container_width=True)
+    selected = summary[summary["Metric"].eq(metric)]
+    st.caption(
+        "Two-sided Wilcoxon signed-rank tests compare identical image × method × metric pairs. "
+        "Holm correction covers 25 tests for this model pair. Paired N and excluded N are reported."
+    )
+    st.dataframe(_format_results_analysis_table(selected), use_container_width=True, hide_index=True)
+    with st.expander("All paired-model Wilcoxon results"):
+        st.dataframe(_format_results_analysis_table(summary), use_container_width=True, hide_index=True)
+        suffix = "same_target" if same_target else "all_pairs"
+        _download_csv(
+            "Download paired-model results", summary,
+            f"model_comparison_{pair[0]}_vs_{pair[1]}_{suffix}.csv", "download-paired-models",
         )
 
-    with st.expander("Dunn post-hoc KL comparisons"):
-        if not complete_primary_family:
-            st.info(
-                "Dunn post-hoc comparisons require the complete primary KL analysis: five metrics, "
-                "five XAI methods, and all five KL groups for every selected model."
-            )
-            return
-        try:
-            posthoc = dunn_posthoc(results, analysis)
-        except ResearchAnalysisError as exc:
-            st.error(f"Post-hoc comparisons are unavailable: {exc}")
-            return
-        if posthoc.empty:
-            st.info("No Holm-significant global KL tests were available for post-hoc comparison.")
+
+def _show_correctness(results: pd.DataFrame) -> None:
+    st.caption(
+        "Correctness means predicted KL = true KL. Statistical significance does not prove clinical utility "
+        "or explanation faithfulness. No observations are pooled across methods or metrics."
+    )
+    try:
+        values = prediction_correctness_values(results)
+        summary = _cached_prediction_correctness_analysis(results)
+    except ResearchAnalysisError as exc:
+        st.info(f"Prediction correctness analysis unavailable: {exc}")
+        return
+    mode = st.radio(
+        "Inference mode",
+        ["Primary · pooled correct vs incorrect", "KL-adjusted sensitivity · stratified permutation"],
+        horizontal=True, key="correctness-mode",
+    )
+    adjusted = mode.startswith("KL-adjusted")
+    st.caption(
+        "Cells are pooled rank-biserial effects: positive means higher metric values for correct predictions. "
+        "A * denotes Holm significance in this mode. The direction of preference depends on the metric."
+    )
+    models = sorted(summary["Model"].unique())
+    for offset in range(0, len(models), 2):
+        columns = st.columns(min(2, len(models) - offset))
+        for column, model in zip(columns, models[offset:offset + 2]):
+            with column:
+                st.altair_chart(
+                    _correctness_effect_heatmap(
+                        _correctness_effect_heatmap_data(summary, model, kl_adjusted=adjusted),
+                        _model_label(model),
+                    ),
+                    use_container_width=True,
+                )
+    st.caption(
+        "Primary: two-sided Mann–Whitney U with Holm correction across 25 tests per model. "
+        "Sensitivity: 10,000 fixed-seed permutations within true-KL strata, with a separate Holm correction."
+    )
+    selectors = st.columns(3)
+    model = selectors[0].selectbox("Model", models, format_func=_model_label, key="correctness-model")
+    metric = selectors[1].selectbox("Metric", list(METHOD_COMPARISON_METRICS), key="correctness-metric")
+    method = selectors[2].selectbox("XAI method", XAI_METHODS, key="correctness-method")
+    chosen = summary[
+        summary["Model"].eq(model) & summary["Metric"].eq(metric) & summary["XAI method"].eq(method)
+    ]
+    if chosen.empty:
+        st.info("No comparison exists for this selection.")
+        return
+    row = chosen.iloc[0]
+    st.altair_chart(_correctness_distribution_chart(values, row, metric), use_container_width=True)
+    p_column = "KL-adjusted permutation p Holm" if adjusted else "p Holm"
+    st.caption(
+        f"Correct N: {int(row['Correct N'])}; incorrect N: {int(row['Incorrect N'])}; "
+        f"excluded N: {int(row['Excluded N'])}; adjusted p: {row[p_column]:.3g}. "
+        "KL adjustment is a sensitivity analysis, not a replacement for the primary comparison."
+    )
+    with st.expander("All prediction-correctness statistics"):
+        st.dataframe(_format_results_analysis_table(summary), use_container_width=True, hide_index=True)
+        _download_csv(
+            "Download prediction-correctness results", summary,
+            "prediction_correctness_analysis.csv", "download-correctness",
+        )
+
+
+def _show_model_comparison(results: pd.DataFrame) -> None:
+    st.subheader("Model Comparison")
+    st.caption("All tests are metric-specific and pair images by sample ID. No overall architecture winner is inferred.")
+    section = st.radio(
+        "Comparison type", ["Paired models", "Prediction correctness"],
+        horizontal=True, key="model-comparison-section",
+    )
+    if section == "Paired models":
+        _show_paired_models(results)
+    else:
+        _show_correctness(results)
+
+
+def _show_explore_export(results: pd.DataFrame) -> None:
+    st.subheader("Explore & Export")
+    st.caption("Filters below affect only this exploratory view. Other research sections use the selected analysis cohort without these filters.")
+    columns = st.columns(4)
+    model_ids = sorted(results["model_name"].unique())
+    model = columns[0].selectbox(
+        "Model", [*model_ids, "All"],
+        format_func=lambda item: "All models" if item == "All" else _model_label(item),
+        key="explore-model",
+    )
+    method = columns[1].selectbox("XAI method", ["All", *[m for m in XAI_METHODS if m in set(results["xai_method"])]], key="explore-method")
+    grades = columns[2].multiselect("True KL grade", list(range(5)), default=list(range(5)), key="explore-kl")
+    correctness = columns[3].selectbox("Prediction correctness", ["All", "Correct", "Incorrect"], key="explore-correctness")
+    filtered = results[results["true_kl"].isin(grades)].copy()
+    if model != "All":
+        filtered = filtered[filtered["model_name"].eq(model)]
+    if method != "All":
+        filtered = filtered[filtered["xai_method"].eq(method)]
+    if correctness != "All":
+        filtered = filtered[filtered["is_correct"].eq(correctness == "Correct")]
+    st.caption(
+        f"Exploratory scope: {filtered['sample_id'].nunique()} image(s), {len(filtered)} metric row(s) "
+        f"from the {len(results)}-row analysis cohort."
+    )
+    if not filtered.empty:
+        filtered["dashboard_category"] = [
+            _metric_category(metric_name, category)
+            for metric_name, category in zip(filtered["metric_name"], filtered["metric_category"])
+        ]
+        sources = filtered.get("metric_source", pd.Series(None, index=filtered.index))
+        filtered["is_custom_check"] = [
+            _is_custom_check(metric_name, source)
+            for metric_name, source in zip(filtered["metric_name"], sources)
+        ]
+        dimension = st.radio(
+            "Evaluation dimension", [label for label, _ in DIMENSIONS],
+            horizontal=True, key="explore-dimension",
+        )
+        category = dict(DIMENSIONS)[dimension]
+        category_rows = (
+            filtered[filtered["is_custom_check"]]
+            if category == "custom" else filtered[filtered["dashboard_category"].eq(category)]
+        )
+        if category_rows.empty:
+            st.info(f"No {dimension.lower()} results match the exploratory filters.")
         else:
-            st.caption("Dunn pairwise tests are calculated only after a Holm-significant global test; each set of ten KL pairs uses Holm correction.")
-            st.dataframe(_format_results_analysis_table(posthoc), use_container_width=True, hide_index=True)
+            metrics = sorted(category_rows["metric_name"].unique())
+            metric = st.selectbox("Metric", metrics, key=f"explore-metric-{category}")
+            metric_rows = _selected_metric_rows(category_rows, metric)
+            if model == "All" and metric_rows["model_name"].nunique() > 1:
+                displayed_model = st.selectbox(
+                    "Model to display", sorted(metric_rows["model_name"].unique()),
+                    format_func=_model_label, key="explore-displayed-model",
+                )
+                st.caption("Switch models here to inspect each separately. The filtered CSV download still includes all selected models.")
+                _show_metric_dashboard(metric_rows[metric_rows["model_name"].eq(displayed_model)], metric)
+            else:
+                _show_metric_dashboard(metric_rows, metric)
+        with st.expander("Filtered metric rows and CSV"):
+            st.dataframe(filtered.drop(columns=["dashboard_category", "is_custom_check"]), use_container_width=True, hide_index=True)
+            _download_csv(
+                "Download filtered results", filtered.drop(columns=["dashboard_category", "is_custom_check"]),
+                "filtered_research_results.csv", "download-filtered",
+            )
+    else:
+        st.info("No rows match the exploratory filters.")
+
+
+def _show_research_toolkit() -> None:
+    """Offer the data-free runner before the user needs to have any results."""
+    with st.container(border=True):
+        try:
+            toolkit = _cached_toolkit()
+        except OSError as exc:
+            st.error(f"Research toolkit cannot be packaged: {exc}")
+            return
+        heading, action = st.columns([3, 1], vertical_alignment="center")
+        with heading:
+            st.markdown("**Reproduce an XAI experiment**")
+            st.caption("Runner, statistical analysis and setup guide. No CSV required to download.")
+        with action:
             st.download_button(
-                "Download Dunn post-hoc CSV",
-                data=posthoc.to_csv(index=False).encode("utf-8"),
-                file_name="dunn_posthoc_kl_pairs.csv",
-                mime="text/csv",
+                "Research Toolkit (.zip)", toolkit,
+                file_name="kneexai_research_toolkit.zip", mime="application/zip",
+                key="download-research-toolkit-top", use_container_width=True,
+            )
+        with st.expander("How to run the experiment · detailed instructions"):
+            st.markdown(
+                "1. Install dependencies and provide matching `.pth` and `.onnx` models.\n"
+                "2. Prepare a labelled JSON manifest and run `scripts/run_research.py`.\n"
+                "3. Load the resulting CSV here, or run `scripts/analyze_research_results.py` offline."
+            )
+            try:
+                guide = (Path(__file__).resolve().parent / "research_toolkit/README.md").read_text(encoding="utf-8")
+            except OSError as exc:
+                st.error(f"Research toolkit guide is unavailable: {exc}")
+            else:
+                st.markdown(guide)
+            st.download_button(
+                "Download Research Toolkit (.zip)", toolkit,
+                file_name="kneexai_research_toolkit.zip", mime="application/zip",
+                key="download-research-toolkit-guide",
             )
 
 
 def show_research_mode() -> None:
     st.header("Research Mode")
-    st.caption(
-        "Explore precomputed XAI evaluation results. This mode does not run models or metrics."
-    )
+    st.caption("Run or reproduce an XAI experiment, then analyze its precomputed results here.")
 
-    available_files = sorted(RESEARCH_RESULTS_DIR.glob("*.csv"))
-    source_mode = st.radio(
-        "Research results source",
-        ["Repository CSV files", "Upload CSV files"],
-        horizontal=True,
-    )
+    _show_research_toolkit()
 
-    try:
-        if source_mode == "Upload CSV files":
-            uploaded_files = st.file_uploader(
-                "Upload one or more research-results CSV files",
-                type=["csv"],
-                accept_multiple_files=True,
-            )
-            if not uploaded_files:
-                st.info("Upload one or more CSV files to begin.")
-                return
-            frames = [validate_research_results(pd.read_csv(uploaded_file)) for uploaded_file in uploaded_files]
-            source_names = [uploaded_file.name for uploaded_file in uploaded_files]
-        else:
-            selected_paths = st.multiselect(
-                "Research result files",
-                available_files,
-                format_func=lambda path: path.name,
-            )
-            if not selected_paths:
-                st.info("Select one or more repository CSV files to begin.")
-                return
-            frames = [load_research_results(path) for path in selected_paths]
-            source_names = [path.name for path in selected_paths]
-            if any(path.name.startswith("demo_") for path in selected_paths):
-                st.warning("Demo data only: synthetic values must not be used in research conclusions.")
-        results = merge_research_results(frames)
-        st.caption("Loaded: " + ", ".join(source_names))
-    except (OSError, pd.errors.ParserError, ResearchResultsValidationError, ResearchAnalysisError) as exc:
-        st.error(f"Could not load research results: {exc}")
-        return
-
-    results = results[results["metric_name"] != "Focus area ratio"].copy()
-    if results.empty:
-        st.warning("This file contains no supported, non-legacy metrics.")
-        return
-
-    filters = st.columns(4)
-    selected_model = filters[0].selectbox("Model", all_option(results["model_name"].unique()))
-    selected_method = filters[1].selectbox("XAI method", all_option(results["xai_method"].unique()))
-    selected_grades = filters[2].multiselect(
-        "True KL grade",
-        options=[0, 1, 2, 3, 4],
-        default=[0, 1, 2, 3, 4],
-    )
-    correctness = filters[3].selectbox("Prediction correctness", ["All", "Correct", "Incorrect"])
-
-    filtered = results[results["true_kl"].isin(selected_grades)].copy()
-    if selected_model != "All":
-        filtered = filtered[filtered["model_name"] == selected_model]
-    if selected_method != "All":
-        filtered = filtered[filtered["xai_method"] == selected_method]
-    if correctness == "Correct":
-        filtered = filtered[filtered["is_correct"]]
-    elif correctness == "Incorrect":
-        filtered = filtered[~filtered["is_correct"]]
-
-    filtered["dashboard_category"] = [
-        _metric_category(metric, category)
-        for metric, category in zip(filtered["metric_name"], filtered["metric_category"])
-    ]
-    metric_sources = filtered.get("metric_source", pd.Series(None, index=filtered.index))
-    filtered["is_custom_check"] = [
-        _is_custom_check(metric, source)
-        for metric, source in zip(filtered["metric_name"], metric_sources)
-    ]
-    results_tab, dashboard_tab = st.tabs(["Results analysis", "Explore metrics"])
-    with results_tab:
-        _show_results_analysis(results)
-    with dashboard_tab:
-        if filtered.empty:
-            st.warning("No rows match the selected exploratory filters.")
-            return
-        tabs = st.tabs([label for label, _ in DIMENSIONS])
-        for tab, (label, category) in zip(tabs, DIMENSIONS):
-            with tab:
-                category_rows = (
-                    filtered[filtered["is_custom_check"]]
-                    if category == "custom"
-                    else filtered[filtered["dashboard_category"] == category]
+    with st.container(border=True):
+        source_mode = st.radio(
+            "Research results source",
+            ["Repository CSV files", "Upload CSV files"],
+            horizontal=True, key="research-source",
+        )
+        try:
+            if source_mode == "Upload CSV files":
+                uploads = st.file_uploader(
+                    "Upload one or more research CSV files", type=["csv"],
+                    accept_multiple_files=True, key="research-upload",
                 )
-                if category_rows.empty:
-                    if category == "custom":
-                        st.info("No custom checks match the active filters.")
-                    else:
-                        st.info(f"No {label.lower()} metrics match the active filters.")
-                    continue
-                if category == "custom":
-                    st.caption(
-                        "Supporting project-specific checks. Legacy deletion rows and stability appear here; "
-                        "new research runs use Quantus Region Perturbation under Faithfulness."
-                    )
-                metrics = sorted(category_rows["metric_name"].unique())
-                selected_metric = metrics[0] if len(metrics) == 1 else st.selectbox("Metric", metrics, key=f"research-metric-{category}")
-                _show_metric_dashboard(_selected_metric_rows(category_rows, selected_metric), selected_metric)
+                if not uploads:
+                    st.info("Upload at least one research CSV to begin.")
+                    return
+                frames = [validate_research_results(pd.read_csv(upload)) for upload in uploads]
+                source_names = [upload.name for upload in uploads]
+            else:
+                available = sorted(RESEARCH_RESULTS_DIR.glob("*.csv"))
+                selected = st.multiselect(
+                    "Repository research CSV files", available,
+                    format_func=lambda path: path.name, key="research-repository-files",
+                )
+                if not selected:
+                    st.info("Select one or more repository CSV files to begin.")
+                    return
+                frames = [load_research_results(path) for path in selected]
+                source_names = [path.name for path in selected]
+                if any(path.name.startswith("demo_") for path in selected):
+                    st.warning("Synthetic demo data must not be used for research conclusions.")
+            results = merge_research_results(frames)
+            _validate_shared_cohort(results)
+        except (OSError, ValueError, pd.errors.ParserError,
+                ResearchResultsValidationError, ResearchAnalysisError) as exc:
+            st.error(f"Research CSV validation failed: {exc}")
+            return
+        results = results[results["metric_name"].ne("Focus area ratio")].copy()
+        if results.empty:
+            st.warning("No supported metric rows are available in these files.")
+            return
+        st.caption("Loaded: " + ", ".join(source_names))
+        results = _research_cohort(results)
+        if results.empty:
+            st.info("No images are available in this analysis cohort.")
+            return
+        _research_data_summary(results)
+
+    section = st.radio(
+        "Research section",
+        ["Overview", "KL-stage Analysis", "XAI Methods", "Model Comparison", "Explore & Export"],
+        horizontal=True, key="research-navigation",
+    )
+    try:
+        if section == "Overview":
+            _show_research_overview(results)
+        elif section == "KL-stage Analysis":
+            _show_kl_stage(results)
+        elif section == "XAI Methods":
+            _show_xai_methods(results)
+        elif section == "Model Comparison":
+            _show_model_comparison(results)
+        else:
+            _show_explore_export(results)
+    except ResearchAnalysisError as exc:
+        st.error(f"{section} is unavailable for this cohort: {exc}")
 
 
 def show_xai(
