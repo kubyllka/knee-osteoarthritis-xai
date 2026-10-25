@@ -1212,6 +1212,30 @@ def _show_xai_methods(results: pd.DataFrame) -> None:
     except ResearchAnalysisError as exc:
         st.error(f"XAI-method analysis unavailable: {exc}")
         return
+    st.caption(
+        "Complete CSV exports cover every available model and metric in the active research cohort, "
+        "regardless of the metric selected for the charts below. Wilcoxon pairs exist only after "
+        "a Holm-significant Friedman test for that model and metric."
+    )
+    friedman_download, wilcoxon_download = st.columns(2)
+    with friedman_download:
+        _download_csv(
+            "Download all Friedman paired tests", summary,
+            "friedman_xai_method_analysis_all_metrics.csv", "download-friedman-all",
+        )
+    try:
+        all_posthoc = _cached_method_posthoc(matrices, summary)
+    except ResearchAnalysisError as exc:
+        all_posthoc = None
+        st.warning(f"Wilcoxon post-hoc unavailable: {exc}")
+    with wilcoxon_download:
+        if all_posthoc is not None and not all_posthoc.empty:
+            _download_csv(
+                "Download all Wilcoxon method pairs", all_posthoc,
+                "wilcoxon_xai_method_pairs_all_metrics.csv", "download-method-posthoc-all",
+            )
+        elif all_posthoc is not None:
+            st.caption("No Holm-significant Friedman tests; no Wilcoxon pairs were generated.")
     selected = summary[summary["Metric"].eq(metric)]
     if selected.empty or values[values["Metric"].eq(metric)].empty:
         st.info("No complete paired samples are available for this metric.")
@@ -1240,12 +1264,10 @@ def _show_xai_methods(results: pd.DataFrame) -> None:
     )
     st.dataframe(_format_results_analysis_table(selected), use_container_width=True, hide_index=True)
     with st.expander("Wilcoxon post-hoc method pairs"):
-        try:
-            posthoc = _cached_method_posthoc(matrices, summary)
-        except ResearchAnalysisError as exc:
-            st.error(f"Wilcoxon post-hoc unavailable: {exc}")
+        if all_posthoc is None:
+            st.error("Wilcoxon post-hoc unavailable for this cohort.")
         else:
-            posthoc = posthoc[posthoc["Metric"].eq(metric)] if not posthoc.empty else posthoc
+            posthoc = all_posthoc[all_posthoc["Metric"].eq(metric)] if not all_posthoc.empty else all_posthoc
             if posthoc.empty:
                 st.info("No Holm-significant Friedman result for this metric; no pairwise test is shown.")
             else:
@@ -1254,7 +1276,6 @@ def _show_xai_methods(results: pd.DataFrame) -> None:
                 _download_csv("Download Wilcoxon pairs", posthoc, f"wilcoxon_{metric}.csv", "download-method-posthoc")
     with st.expander("Full XAI-method tables and CSV"):
         st.dataframe(_format_results_analysis_table(summary), use_container_width=True, hide_index=True)
-        _download_csv("Download Friedman summary", summary, "friedman_xai_method_analysis.csv", "download-friedman")
         _download_csv("Download method descriptives", descriptives, "xai_method_descriptives.csv", "download-method-descriptive")
 
 

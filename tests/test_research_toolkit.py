@@ -17,6 +17,7 @@ from streamlit_app import (
     _model_label,
     _show_research_toolkit,
     _summary_card_values,
+    _show_xai_methods,
     _validate_shared_cohort,
     show_research_mode,
 )
@@ -42,6 +43,30 @@ class ResearchToolkitTests(unittest.TestCase):
         args = parse_args(["one.csv", "--output-dir", "out", "--analysis", "classifier"])
         self.assertEqual(args.analysis, "classifier")
         self.assertEqual(args.csv_files, [Path("one.csv")])
+
+    def test_method_exports_include_all_metrics_even_if_selected_metric_has_no_rows(self):
+        summary = pd.DataFrame({
+            "Model": ["resnet50", "densenet121"],
+            "Metric": ["MaxSensitivity", "Sparseness"],
+        })
+        posthoc = pd.DataFrame({
+            "Model": ["resnet50", "densenet121"],
+            "Metric": ["MaxSensitivity", "Sparseness"],
+        })
+        values = pd.DataFrame({"Metric": ["MaxSensitivity"]})
+        with (
+            patch("streamlit_app.st") as streamlit,
+            patch("streamlit_app._cached_method_analysis", return_value=({}, values, pd.DataFrame(), summary)),
+            patch("streamlit_app._cached_method_posthoc", return_value=posthoc),
+            patch("streamlit_app._download_csv") as download,
+        ):
+            streamlit.selectbox.return_value = "FaithfulnessCorrelation"
+            streamlit.columns.return_value = [MagicMock(), MagicMock()]
+            _show_xai_methods(pd.DataFrame())
+
+        self.assertEqual(download.call_count, 2)
+        self.assertIs(download.call_args_list[0].args[1], summary)
+        self.assertIs(download.call_args_list[1].args[1], posthoc)
 
     def test_kaggle_notebook_in_bundle_is_parseable_and_has_no_saved_outputs(self):
         with ZipFile(BytesIO(build_research_toolkit_zip(ROOT))) as bundle:
