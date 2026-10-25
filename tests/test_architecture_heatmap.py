@@ -10,6 +10,7 @@ from app.research.analysis import (
 from streamlit_app import (
     _architecture_effect_heatmap_data,
     _architecture_effect_heatmap_figure,
+    _architecture_figure_title,
     _architecture_heatmap_bytes,
 )
 
@@ -86,11 +87,23 @@ class ArchitectureHeatmapTests(unittest.TestCase):
 
     def test_png_and_svg_export_use_same_analysis_grid(self):
         data = _architecture_effect_heatmap_data(example_summary(), MODELS)
-        figure = _architecture_effect_heatmap_figure(data, MODELS, "Same target")
-        self.assertIn("Same target", figure.axes[0].get_title(loc="left"))
+        figure = _architecture_effect_heatmap_figure(data, MODELS)
+        self.assertEqual(figure.axes[0].get_title(loc="left"), "DenseNet-121 vs ResNet-50")
         self.assertEqual(len(figure.axes[0].texts), 25)
+        self.assertEqual(len(figure.texts), 0)
+        self.assertEqual(figure.axes[0].title.get_fontsize(), 12)
+        cmap = figure.axes[0].images[0].cmap
+        self.assertGreater(cmap(0.0)[0], cmap(0.0)[2])  # Negative: warm red.
+        self.assertGreater(cmap(1.0)[2], cmap(1.0)[0])  # Positive: blue.
+        self.assertGreater(min(cmap(0.5)[:3]), 0.9)  # Near zero: light neutral.
         self.assertTrue(_architecture_heatmap_bytes(figure, "png").startswith(b"\x89PNG"))
         self.assertIn(b"<svg", _architecture_heatmap_bytes(figure, "svg"))
+
+    def test_same_architecture_variants_are_not_labeled_as_two_architectures(self):
+        self.assertEqual(
+            _architecture_figure_title(("densenet121_class_aware", "densenet121")),
+            "DenseNet-121 variants",
+        )
 
 
 if __name__ == "__main__":

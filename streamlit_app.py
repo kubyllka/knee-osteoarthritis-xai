@@ -839,28 +839,46 @@ def _architecture_effect_heatmap_data(
     return data
 
 
-def _architecture_effect_heatmap_figure(
-    data: pd.DataFrame, models: tuple[str, str], mode: str
-):
+def _architecture_figure_title(models: tuple[str, str]) -> str:
+    names = {
+        "densenet121": "DenseNet-121",
+        "resnet50": "ResNet-50",
+    }
+    first, second = (
+        names.get(MODEL_CONFIGS.get(model, {}).get("architecture"), _model_label(model))
+        for model in models
+    )
+    return f"{first} variants" if first == second else f"{first} vs {second}"
+
+
+def _architecture_effect_heatmap_figure(data: pd.DataFrame, models: tuple[str, str]):
     """Render the paired-model effect map without recalculating any tests."""
-    from matplotlib import colormaps
-    from matplotlib.colors import Normalize
+    from matplotlib.colors import LinearSegmentedColormap, Normalize
     from matplotlib.figure import Figure
 
     matrix = data["Display effect"].to_numpy(dtype=float).reshape(5, 5)
-    fig = Figure(figsize=(11.4, 6.4))
+    fig = Figure(figsize=(10.6, 5.2), layout="constrained")
     ax = fig.subplots()
-    cmap = colormaps["RdBu"].with_extremes(bad="#edf0f4")  # Negative = red; positive = blue.
+    cmap = LinearSegmentedColormap.from_list(
+        "kneexai_soft_diverging",
+        ["#B86960", "#E8CBC2", "#F7F8F7", "#CFDFEA", "#5B89B0"],
+    ).with_extremes(bad="#edf0f4")  # Negative = warm red; positive = blue.
     image = ax.imshow(np.ma.masked_invalid(matrix), cmap=cmap, norm=Normalize(-1, 1), aspect="auto")
-    ax.set_xticks(range(5), ["Grad-CAM", "Grad-CAM++", "EigenCAM", "Integrated\nGradients", "SmoothGrad"])
+    ax.set_xticks(range(5), ["Grad-CAM", "Grad-CAM++", "EigenCAM", "Integrated Gradients", "SmoothGrad"])
     ax.set_yticks(range(5), [
         "Faithfulness Correlation", "Region Perturbation", "MaxSensitivity",
         "Stability Score", "Sparseness",
     ])
+    for tick in ax.get_xticklabels():
+        tick.set_rotation(-35)
+        tick.set_horizontalalignment("left")
+        tick.set_rotation_mode("anchor")
     ax.set_xticks(np.arange(-0.5, 5, 1), minor=True)
     ax.set_yticks(np.arange(-0.5, 5, 1), minor=True)
-    ax.grid(which="minor", color="white", linewidth=2)
-    ax.tick_params(which="minor", bottom=False, left=False)
+    ax.grid(which="minor", color="#F8FAFC", linewidth=1.5)
+    ax.tick_params(axis="both", which="both", length=0, labelsize=10, colors="#475569")
+    for spine in ax.spines.values():
+        spine.set_visible(False)
     for index, row in data.reset_index(drop=True).iterrows():
         value = row["Display effect"]
         text_color = "#17253E"
@@ -876,17 +894,12 @@ def _architecture_effect_heatmap_figure(
             color=text_color,
             weight="bold" if bool(row["Display significant"]) else "normal", fontsize=11,
         )
-    first, second = (_model_label(model) for model in models)
-    ax.set_title(f"{first} vs {second} · {mode}", loc="left", color="#17253E", pad=18)
-    colorbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.02)
-    colorbar.set_label("Rank-biserial correlation")
-    fig.text(
-        0.5, 0.02,
-        f"Positive: higher signed-rank tendency for {first}. Negative: for {second}. "
-        "* Holm-adjusted p < 0.05.",
-        ha="center", fontsize=9, color="#475569",
-    )
-    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    ax.set_title(_architecture_figure_title(models), loc="left", color="#17253E", fontsize=12, pad=12)
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.025)
+    colorbar.set_label("Rank-biserial correlation", fontsize=9, color="#475569", labelpad=9)
+    colorbar.set_ticks([-1, -0.5, 0, 0.5, 1])
+    colorbar.ax.tick_params(labelsize=9, colors="#475569", length=0)
+    colorbar.outline.set_edgecolor("#E2E8F0")
     return fig
 
 
@@ -1420,15 +1433,15 @@ def _show_paired_models(results: pd.DataFrame) -> None:
     st.markdown("#### Paired-model effect sizes")
     heatmap_data = _architecture_effect_heatmap_data(summary, pair)
     mode_label = "Same target" if same_target else "All pairs"
-    figure = _architecture_effect_heatmap_figure(heatmap_data, pair, mode_label)
+    figure = _architecture_effect_heatmap_figure(heatmap_data, pair)
     png = _architecture_heatmap_bytes(figure, "png")
     svg = _architecture_heatmap_bytes(figure, "svg")
     figure.clear()
     st.image(png, use_container_width=True)
     st.caption(
-        f"Positive values: higher signed-rank tendency for {_model_label(pair[0])}. "
-        f"Negative values: for {_model_label(pair[1])}. * Holm-adjusted p < 0.05. "
-        "This is not an overall model-quality ranking; interpretation depends on the metric."
+        f"Model A: {_model_label(pair[0])}; Model B: {_model_label(pair[1])}; {mode_label}. "
+        "Blue: higher values for A; warm red: higher values for B; * Holm-adjusted p < 0.05. "
+        "Interpret each metric separately."
     )
     paired_images = int(values["sample_id"].nunique()) if not values.empty else 0
     reduced = heatmap_data[pd.to_numeric(heatmap_data["Paired N"], errors="coerce").lt(paired_images)]
@@ -1458,7 +1471,9 @@ def _show_paired_models(results: pd.DataFrame) -> None:
 
 
 def _show_correctness(results: pd.DataFrame) -> None:
+    st.subheader("Prediction Correctness")
     st.caption(
+        "Compare correct and incorrect predictions within each model, not DenseNet-121 against ResNet-50. "
         "Correctness means predicted KL = true KL. Statistical significance does not prove clinical utility "
         "or explanation faithfulness. No observations are pooled across methods or metrics."
     )
@@ -1522,15 +1537,11 @@ def _show_correctness(results: pd.DataFrame) -> None:
 
 def _show_model_comparison(results: pd.DataFrame) -> None:
     st.subheader("Model Comparison")
-    st.caption("All tests are metric-specific and pair images by sample ID. No overall architecture winner is inferred.")
-    section = st.radio(
-        "Comparison type", ["Paired models", "Prediction correctness"],
-        horizontal=True, key="model-comparison-section",
+    st.caption(
+        "Paired model configurations are compared on the same images, XAI methods and metrics. "
+        "All tests are metric-specific; no overall architecture winner is inferred."
     )
-    if section == "Paired models":
-        _show_paired_models(results)
-    else:
-        _show_correctness(results)
+    _show_paired_models(results)
 
 
 def _show_explore_export(results: pd.DataFrame) -> None:
@@ -1693,7 +1704,10 @@ def show_research_mode() -> None:
 
     section = st.radio(
         "Research section",
-        ["Overview", "KL-stage Analysis", "XAI Methods", "Model Comparison", "Explore & Export"],
+        [
+            "Overview", "KL-stage Analysis", "XAI Methods", "Model Comparison",
+            "Prediction Correctness", "Explore & Export",
+        ],
         horizontal=True, key="research-navigation",
     )
     try:
@@ -1705,6 +1719,8 @@ def show_research_mode() -> None:
             _show_xai_methods(results)
         elif section == "Model Comparison":
             _show_model_comparison(results)
+        elif section == "Prediction Correctness":
+            _show_correctness(results)
         else:
             _show_explore_export(results)
     except ResearchAnalysisError as exc:
