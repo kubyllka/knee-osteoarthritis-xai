@@ -555,7 +555,7 @@ def _architecture_distribution(prefix: str, values: pd.Series) -> dict[str, floa
 
 
 def _rank_biserial_correlation(differences: np.ndarray) -> float:
-    """Rank-biserial correlation where positive means DenseNet121 is higher."""
+    """Positive means the first model in the supplied paired difference is higher."""
     nonzero = differences[~np.isclose(differences, 0.0)]
     if not len(nonzero):
         return 0.0

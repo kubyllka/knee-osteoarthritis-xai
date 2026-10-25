@@ -806,6 +806,96 @@ def _architecture_comparison_chart(values: pd.DataFrame, analysis: pd.DataFrame,
     return (boxes + medians + labels).properties(height=350)
 
 
+def _architecture_effect_heatmap_data(
+    analysis: pd.DataFrame, models: tuple[str, str]
+) -> pd.DataFrame:
+    """Place existing paired-test effects on a fixed 5 × 5 display grid."""
+    if "Model pair" in analysis.columns and any(
+        tuple(pair) != models for pair in analysis["Model pair"]
+    ):
+        raise ValueError("Heatmap results do not match the selected model order.")
+    keys = ["Metric", "XAI method"]
+    if analysis.duplicated(keys).any():
+        raise ValueError("Heatmap results contain duplicate method × metric tests.")
+    grid = pd.MultiIndex.from_product(
+        [METHOD_COMPARISON_METRICS, XAI_METHODS], names=keys
+    ).to_frame(index=False)
+    data = grid.merge(analysis, on=keys, how="left", validate="one_to_one")
+    effect = pd.to_numeric(data["Rank-biserial correlation"], errors="coerce")
+    adjusted_p = pd.to_numeric(data["p Holm"], errors="coerce")
+    paired_n = pd.to_numeric(data["Paired N"], errors="coerce")
+    valid = (
+        data["Test status"].isin(("ok", "all paired differences zero"))
+        & np.isfinite(effect) & effect.between(-1, 1)
+        & np.isfinite(adjusted_p) & paired_n.ge(2)
+    )
+    data["Display effect"] = effect.where(valid)
+    data["Display significant"] = valid & adjusted_p.lt(0.05)
+    data["Cell label"] = [
+        (f"{value:+.2f}".replace("-", "−") + ("*" if significant else ""))
+        if pd.notna(value) else "N/A"
+        for value, significant in zip(data["Display effect"], data["Display significant"])
+    ]
+    return data
+
+
+def _architecture_effect_heatmap_figure(
+    data: pd.DataFrame, models: tuple[str, str], mode: str
+):
+    """Render the paired-model effect map without recalculating any tests."""
+    from matplotlib import colormaps
+    from matplotlib.colors import Normalize
+    from matplotlib.figure import Figure
+
+    matrix = data["Display effect"].to_numpy(dtype=float).reshape(5, 5)
+    fig = Figure(figsize=(11.4, 6.4))
+    ax = fig.subplots()
+    cmap = colormaps["RdBu"].with_extremes(bad="#edf0f4")  # Negative = red; positive = blue.
+    image = ax.imshow(np.ma.masked_invalid(matrix), cmap=cmap, norm=Normalize(-1, 1), aspect="auto")
+    ax.set_xticks(range(5), ["Grad-CAM", "Grad-CAM++", "EigenCAM", "Integrated\nGradients", "SmoothGrad"])
+    ax.set_yticks(range(5), [
+        "Faithfulness Correlation", "Region Perturbation", "MaxSensitivity",
+        "Stability Score", "Sparseness",
+    ])
+    ax.set_xticks(np.arange(-0.5, 5, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, 5, 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=2)
+    ax.tick_params(which="minor", bottom=False, left=False)
+    for index, row in data.reset_index(drop=True).iterrows():
+        value = row["Display effect"]
+        text_color = "#17253E"
+        if pd.notna(value):
+            shade = np.asarray(cmap((float(value) + 1) / 2)[:3])
+            linear = np.where(shade <= 0.04045, shade / 12.92, ((shade + 0.055) / 1.055) ** 2.4)
+            luminance = float(np.dot(linear, (0.2126, 0.7152, 0.0722)))
+            white_contrast = 1.05 / (luminance + 0.05)
+            dark_contrast = (luminance + 0.05) / (0.018 + 0.05)
+            text_color = "white" if white_contrast >= dark_contrast else "#17253E"
+        ax.text(
+            index % 5, index // 5, row["Cell label"], ha="center", va="center",
+            color=text_color,
+            weight="bold" if bool(row["Display significant"]) else "normal", fontsize=11,
+        )
+    first, second = (_model_label(model) for model in models)
+    ax.set_title(f"{first} vs {second} · {mode}", loc="left", color="#17253E", pad=18)
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.02)
+    colorbar.set_label("Rank-biserial correlation")
+    fig.text(
+        0.5, 0.02,
+        f"Positive: higher signed-rank tendency for {first}. Negative: for {second}. "
+        "* Holm-adjusted p < 0.05.",
+        ha="center", fontsize=9, color="#475569",
+    )
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    return fig
+
+
+def _architecture_heatmap_bytes(figure, format_name: str) -> bytes:
+    output = BytesIO()
+    figure.savefig(output, format=format_name, dpi=300, bbox_inches="tight", facecolor="white")
+    return output.getvalue()
+
+
 def _correctness_effect_heatmap_data(
     analysis: pd.DataFrame, model_name: str, *, kl_adjusted: bool
 ) -> pd.DataFrame:
@@ -1327,9 +1417,40 @@ def _show_paired_models(results: pd.DataFrame) -> None:
         "Holm correction covers 25 tests for this model pair. Paired N and excluded N are reported."
     )
     st.dataframe(_format_results_analysis_table(selected), use_container_width=True, hide_index=True)
+    st.markdown("#### Paired-model effect sizes")
+    heatmap_data = _architecture_effect_heatmap_data(summary, pair)
+    mode_label = "Same target" if same_target else "All pairs"
+    figure = _architecture_effect_heatmap_figure(heatmap_data, pair, mode_label)
+    png = _architecture_heatmap_bytes(figure, "png")
+    svg = _architecture_heatmap_bytes(figure, "svg")
+    figure.clear()
+    st.image(png, use_container_width=True)
+    st.caption(
+        f"Positive values: higher signed-rank tendency for {_model_label(pair[0])}. "
+        f"Negative values: for {_model_label(pair[1])}. * Holm-adjusted p < 0.05. "
+        "This is not an overall model-quality ranking; interpretation depends on the metric."
+    )
+    paired_images = int(values["sample_id"].nunique()) if not values.empty else 0
+    reduced = heatmap_data[pd.to_numeric(heatmap_data["Paired N"], errors="coerce").lt(paired_images)]
+    st.caption(
+        f"{paired_images} unique images have at least one finite model pair in this mode. "
+        f"{len(reduced)} of 25 method × metric tests use fewer pairs; see Paired N in the table."
+    )
+    suffix = "same_target" if same_target else "all_pairs"
+    filename = f"model_comparison_{pair[0]}_vs_{pair[1]}_{suffix}_heatmap"
+    png_col, svg_col = st.columns(2)
+    with png_col:
+        st.download_button(
+            "Download heatmap (PNG)", png, file_name=f"{filename}.png", mime="image/png",
+            key="download-paired-heatmap-png",
+        )
+    with svg_col:
+        st.download_button(
+            "Download heatmap (SVG)", svg, file_name=f"{filename}.svg", mime="image/svg+xml",
+            key="download-paired-heatmap-svg",
+        )
     with st.expander("All paired-model Wilcoxon results"):
         st.dataframe(_format_results_analysis_table(summary), use_container_width=True, hide_index=True)
-        suffix = "same_target" if same_target else "all_pairs"
         _download_csv(
             "Download paired-model results", summary,
             f"model_comparison_{pair[0]}_vs_{pair[1]}_{suffix}.csv", "download-paired-models",
