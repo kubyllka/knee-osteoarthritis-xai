@@ -1,5 +1,6 @@
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 import random
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -1971,7 +1972,7 @@ def main() -> None:
         alpha = st.slider("Overlay strength", min_value=0.1, max_value=0.8, value=0.45, step=0.05)
         with st.expander("Advanced settings"):
             use_api = st.toggle("Use FastAPI endpoint", value=False)
-            api_url = st.text_input("FastAPI URL", value="http://127.0.0.1:8000")
+            api_url = st.text_input("FastAPI URL", value=os.getenv("KNEEXAI_API_URL", "http://127.0.0.1:8000"))
 
     with st.container(key="prediction-view"):
         st.subheader("Prediction Results")

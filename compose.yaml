@@ -1,0 +1,24 @@
+services:
+  api:
+    build: .
+    image: kneexai:local
+    command: ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./models:/app/models:ro
+
+  web:
+    build: .
+    image: kneexai:local
+    command: ["python", "-m", "streamlit", "run", "streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]
+    ports:
+      - "127.0.0.1:8501:8501"
+    environment:
+      KNEEXAI_API_URL: http://api:8000
+    volumes:
+      - ./models:/app/models:ro
+      - ./inputs:/app/inputs:ro
+      - ./results/research:/app/results/research:ro
+    depends_on:
+      - api

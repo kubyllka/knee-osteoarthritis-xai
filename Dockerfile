@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
@@ -13,8 +13,13 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
-COPY models ./models
+COPY scripts ./scripts
+COPY notebooks/kaggle_research_runner.ipynb ./notebooks/kaggle_research_runner.ipynb
+COPY research_toolkit/README.md ./research_toolkit/README.md
+COPY .streamlit/config.toml ./.streamlit/config.toml
+COPY streamlit_app.py README.md ./
+RUN mkdir -p models inputs results/research
 
-EXPOSE 8000
+EXPOSE 8000 8501
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

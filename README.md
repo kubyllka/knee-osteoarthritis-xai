@@ -30,30 +30,62 @@ Research Mode reads one or more precomputed experiment CSV files. It reports cla
 - `scripts/` - model export, Grad-CAM, and benchmark utilities;
 - `streamlit_app.py` - web interface for image analysis.
 
-## Getting started
+## Run without Docker
 
 Python 3.12 is recommended. Model weights are **not included** in this repository; the application can open Research Mode with compatible CSV files, but Prediction Mode needs model files before it can make a prediction. The expected filenames for each model ID are defined in [`app/config.py`](app/config.py). There is currently no public model-download URL.
 
-Create an environment and install the dependencies:
+On Windows PowerShell, create an environment and install the dependencies:
 
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-For Prediction Mode, place a trusted `.pth` checkpoint and its matching `.onnx` file under `models/` using the names in `app/config.py`. For example, with a supplied class-aware ResNet-50 checkpoint, export its ONNX counterpart:
+On macOS/Linux, the equivalent setup is:
+
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+For Prediction Mode, place a trusted `.pth` checkpoint and its matching `.onnx` file under `models/` using the names in `app/config.py`. ONNX is used for inference; PyTorch checkpoints are needed for XAI. For example, with a supplied class-aware ResNet-50 checkpoint, export its ONNX counterpart:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\export_to_onnx.py --model-id resnet50_class_aware
 ```
 
-Then launch the interface and **select the model for which you supplied files** in the sidebar:
+Use `.venv/bin/python` instead of `.\.venv\Scripts\python.exe` on macOS/Linux. Then launch the interface and **select the model for which you supplied files** in the sidebar:
 
 ```powershell
 .\.venv\Scripts\streamlit.exe run streamlit_app.py
 ```
 
-To run the optional FastAPI service, use `.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload`. On macOS/Linux, use `python3 -m venv .venv`, `.venv/bin/python` and `.venv/bin/streamlit` instead. Research Mode can inspect the bundled example CSVs without model weights; these example and older experiment results are not substitutes for a new final study.
+On macOS/Linux, run `.venv/bin/streamlit run streamlit_app.py` instead. To use the optional FastAPI endpoint, start it in a **second terminal** with `.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload` (or `.venv/bin/python -m uvicorn app.main:app --reload`). Then enable **Use FastAPI endpoint** under Advanced settings; its local URL is `http://127.0.0.1:8000`. Without that toggle, Prediction Mode runs inference locally. Research Mode can inspect compatible CSVs without model weights; example and older experiment results are not substitutes for a new final study.
+
+## Run with Docker Compose
+
+Install Docker with the Compose plugin. The same `compose.yaml` starts **two CPU services**: Streamlit (`web`) and FastAPI (`api`). This is an application setup, not the CUDA dataset-wide research runner.
+
+1. Put the model files you intend to use in `models/` under the exact names in [`app/config.py`](app/config.py). For predictions, provide matching `.onnx` and `.pth` files. If you have only a trusted `.pth` file, export ONNX first using the command above; model files are not downloaded by Compose.
+2. From the repository root, start both services:
+
+   ```bash
+   docker compose up --build -d
+   ```
+
+3. Open **http://127.0.0.1:8501** for Streamlit. The API health endpoint is **http://127.0.0.1:8000/health**. A running API can still report `model_loaded: false` if no ONNX model is present. Select a model whose files you provided.
+
+4. Prediction Mode uses the model mounted in `web` by default. To route its inference through the `api` service, enable **Use FastAPI endpoint** in Advanced settings; inside Compose, the URL field defaults to `http://api:8000`. Keep that internal address in the Streamlit field, not `127.0.0.1`.
+
+Useful commands:
+
+```bash
+docker compose ps
+docker compose logs -f web api
+docker compose down
+```
+
+Compose mounts `models/`, `inputs/` and `results/research/` read-only rather than baking model weights, radiographs or research CSVs into the image. Add your own CSVs to `results/research/` on the host or upload them in Research Mode. `docker compose down` stops the services without deleting those host files. The **Download Research Toolkit** feature is included in the web container. For full GPU XAI experiments, use the separate [research instructions](docs/research_runs.md) and [CUDA requirements](requirements-gpu.md).
 
 ## Research experiments
 
