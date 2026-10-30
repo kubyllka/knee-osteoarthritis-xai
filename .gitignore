@@ -203,9 +203,14 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
-# Trained model artifacts (kept locally; use Git LFS if they need to be versioned)
-models/*.onnx
-models/*.pth
+# Only the two final class-aware model pairs are published through Git LFS.
+# Keep historical and experimental checkpoints local.
+models/*
+!models/.gitkeep
+!models/resnet50_class_aware_ordinal.onnx
+!models/resnet50_class_aware_ordinal.pth
+!models/densenet121_class_aware_ordinal.onnx
+!models/densenet121_class_aware_ordinal.pth
 
 # Ruff stuff:
 .ruff_cache/

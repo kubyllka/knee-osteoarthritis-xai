@@ -41,7 +41,7 @@ def health():
 
 
 @app.post("/predict", response_model=PredictionResponse)
-async def predict(file: UploadFile = File(...), model_name: str = Form("vit")):
+async def predict(file: UploadFile = File(...), model_name: str = Form("resnet50_class_aware")):
     if model_name not in MODEL_CONFIGS:
         raise HTTPException(status_code=422, detail=f"Unsupported model_name: {model_name}")
 

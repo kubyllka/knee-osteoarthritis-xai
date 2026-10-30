@@ -25,14 +25,14 @@ Research Mode reads one or more precomputed experiment CSV files. It reports cla
 ## Project structure
 
 - `app/` - API, inference, preprocessing, and XAI modules;
-- `models/` - local PyTorch checkpoints and ONNX models (not included in Git);
+- `models/` - PyTorch checkpoints and ONNX models; the two final class-aware pairs use Git LFS;
 - `inputs/` - sample X-ray images;
 - `scripts/` - model export, Grad-CAM, and benchmark utilities;
 - `streamlit_app.py` - web interface for image analysis.
 
 ## Run without Docker
 
-Python 3.12 is recommended. Model weights are **not included** in this repository; the application can open Research Mode with compatible CSV files, but Prediction Mode needs model files before it can make a prediction. The expected filenames for each model ID are defined in [`app/config.py`](app/config.py). There is currently no public model-download URL.
+Python 3.12 is recommended. Install Git LFS before cloning, or run `git lfs pull` after cloning, to obtain the two published class-aware checkpoint/ONNX pairs. A source archive that does not include LFS objects is not sufficient for Prediction Mode. Research Mode can open compatible CSV files without models. The expected filenames for each model ID are defined in [`app/config.py`](app/config.py). Historical ordinal-BCE checkpoints are optional local files and are not published via LFS.
 
 On Windows PowerShell, create an environment and install the dependencies:
 
@@ -48,7 +48,7 @@ python3.12 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-For Prediction Mode, place a trusted `.pth` checkpoint and its matching `.onnx` file under `models/` using the names in `app/config.py`. ONNX is used for inference; PyTorch checkpoints are needed for XAI. For example, with a supplied class-aware ResNet-50 checkpoint, export its ONNX counterpart:
+For Prediction Mode, the class-aware `.pth` checkpoints and matching `.onnx` files should be present under `models/` after `git lfs pull`. ONNX is used for inference; PyTorch checkpoints are needed for XAI. If an ONNX file is missing but its trusted checkpoint is available, regenerate it with:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\export_to_onnx.py --model-id resnet50_class_aware
@@ -66,7 +66,7 @@ On macOS/Linux, run `.venv/bin/streamlit run streamlit_app.py` instead. To use t
 
 Install Docker with the Compose plugin. The same `compose.yaml` starts **two CPU services**: Streamlit (`web`) and FastAPI (`api`). This is an application setup, not the CUDA dataset-wide research runner.
 
-1. Put the model files you intend to use in `models/` under the exact names in [`app/config.py`](app/config.py). For predictions, provide matching `.onnx` and `.pth` files. If you have only a trusted `.pth` file, export ONNX first using the command above; model files are not downloaded by Compose.
+1. Run `git lfs pull` on the host to obtain the two class-aware model pairs under `models/`. For historical ordinal-BCE models, supply matching `.onnx` and `.pth` files yourself using the names in [`app/config.py`](app/config.py). Compose mounts these files but does not download them or bake them into the image.
 2. From the repository root, start both services:
 
    ```bash

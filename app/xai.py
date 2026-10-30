@@ -13,7 +13,6 @@ from app.config import (
     NORMALIZE_MEAN,
     NORMALIZE_STD,
     NUM_CLASSES,
-    PYTORCH_CHECKPOINT_PATH,
 )
 from app.model_definition import (
     create_densenet121_ordinal_model,
@@ -90,10 +89,12 @@ def get_target_layer_and_transform(model: torch.nn.Module, model_name: str):
 
 
 def load_xai_model(
-    checkpoint_path: Path = PYTORCH_CHECKPOINT_PATH,
-    model_name: str = "vit",
+    checkpoint_path: Path | None = None,
+    model_name: str = "resnet50_class_aware",
     device: torch.device | str = "cpu",
 ) -> torch.nn.Module:
+    if checkpoint_path is None:
+        checkpoint_path = MODEL_CONFIGS[model_name]["checkpoint_path"]
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"PyTorch checkpoint not found: {checkpoint_path}")
 
@@ -309,7 +310,7 @@ def generate_xai_visualization(
     method: str = "Grad-CAM",
     class_idx: int | None = None,
     alpha: float = 0.45,
-    model_name: str = "vit",
+    model_name: str = "resnet50_class_aware",
 ) -> XAIResult:
     original, input_tensor = preprocess_pil_for_torch(image)
     input_tensor = input_tensor.to(next(model.parameters()).device)

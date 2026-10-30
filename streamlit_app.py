@@ -133,7 +133,7 @@ def get_xai_model(model_name: str):
     return load_xai_model_by_name(model_name)
 
 
-def predict_locally(image_bytes: bytes, model_name: str = "vit") -> dict:
+def predict_locally(image_bytes: bytes, model_name: str = "resnet50_class_aware") -> dict:
     prediction = get_local_classifier(model_name).predict(image_bytes)
     return {
         "grade": prediction.grade,
@@ -1965,7 +1965,11 @@ def main() -> None:
     with st.sidebar:
         model_options = {config["display_name"]: name for name, config in MODEL_CONFIGS.items()}
         st.subheader("Main settings")
-        selected_model_label = st.selectbox("Model", list(model_options.keys()))
+        selected_model_label = st.selectbox(
+            "Model",
+            list(model_options.keys()),
+            index=list(model_options.values()).index("resnet50_class_aware"),
+        )
         model_name = model_options[selected_model_label]
         enable_xai = st.toggle("Show XAI visualization", value=True)
         methods = st.multiselect("XAI methods", XAI_METHODS, default=DEFAULT_XAI_METHODS)
