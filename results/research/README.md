@@ -15,7 +15,7 @@ metric_name, metric_category, metric_value
 - `error_distance` must equal `abs(true_kl - predicted_kl)`.
 - `confidence` is the predicted-class probability from 0 to 1.
 - `metric_category` must be one of `faithfulness`, `robustness`, `complexity`, `randomisation`, or `custom`.
-- `metric_value` must be finite and numeric. Its direction is determined later by metric metadata, not by this contract.
+- `metric_value` must be finite and numeric when `metric_status` is `ok` (or absent in a legacy CSV). For an allowed undefined status, the column is present but its value must be empty. Its direction is determined by metric metadata.
 
 ## Optional reproducibility columns
 
@@ -46,13 +46,13 @@ Research Mode can combine compatible CSV files and calculate a primary KL-stage 
 
 ## Creating real results
 
-Run the offline pipeline from the project root. It reads `inputs/manifest.json` by default and writes a valid Research Mode CSV. A full experiment requires a labelled JSON manifest with real image paths, known `true_kl` labels, and split values. The six-image repository manifest is demonstration-only; labels are never guessed from directory names.
+Run the offline pipeline from the project root. It reads `inputs/manifest.json` by default and writes a valid Research Mode CSV. A full experiment requires a labelled JSON manifest with real image paths, known `true_kl` labels, and split values. The **40-image** repository demo manifest is demonstration-only; labels are never guessed from directory names. See [`docs/research_runs.md`](../../docs/research_runs.md) for the current 250-image manifest caveat and final-run instructions.
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\run_research.py --model resnet50 --methods "Grad-CAM" SmoothGrad
 ```
 
-The runner writes a validated partial CSV after every completed `sample × XAI method`. Continue an interrupted, matching run with `--resume`:
+The runner writes a validated partial CSV after every completed `sample × XAI method`. Continue an interrupted run by repeating its original command, output path, run ID, model, manifest and settings with `--resume`; for example, if the initial run used the following ID:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\run_research.py --model resnet50 --device auto --resume --run-id research-20260825
@@ -60,4 +60,4 @@ The runner writes a validated partial CSV after every completed `sample × XAI m
 
 `--device auto` selects CUDA only when the installed PyTorch build can access it; otherwise it uses CPU. `--device cuda` fails clearly rather than silently using CPU. The base `requirements.txt` is CPU-oriented; see [`requirements-gpu.md`](../../requirements-gpu.md) for the separate CUDA setup. ONNX prediction remains compatible with the base CPU runtime.
 
-For a quick preview run on one sample, use `--limit 1 --faithfulness-runs 8 --max-sensitivity-samples 2`. This is only an exploratory check. Dataset-level thesis runs should use the default 50 FaithfulnessCorrelation perturbations and 8 MaxSensitivity samples with a fixed seed.
+For a quick preview run on one sample, use `--limit 1 --faithfulness-runs 8 --max-sensitivity-samples 2` and a separate run ID/output. This is only an exploratory check. The dataset-level `final_research` profile fixes 50 FaithfulnessCorrelation runs over 1,024 spatial RGB groups, 8 normalised MaxSensitivity samples, and the other protocol settings; it must not be conflated with the non-final defaults.
